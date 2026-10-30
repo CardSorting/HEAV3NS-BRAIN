@@ -56,6 +56,31 @@ async fn test_e2e_server_endpoints() {
         StatusCode::NOT_FOUND
     );
 
+    for body in [
+        serde_json::json!({"model":"singularity-host-development", "messages":[{"role":"tool","content":"result"}]}),
+        serde_json::json!({"model":"singularity-host-development", "messages":[{"role":"user","content":"hello"}], "stop":["end"]}),
+    ] {
+        assert_eq!(
+            client
+                .post(format!("{base_url}/v1/chat/completions"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let unsupported = serde_json::json!({"model":"singularity-host-development", "messages":[{"role":"user","content":"hello"}], "tools":[]});
+    assert!(client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&unsupported)
+        .send()
+        .await
+        .unwrap()
+        .status()
+        .is_client_error());
+
     // 3. Test /v1/chat/completions (non-streaming)
     let req_body = serde_json::json!({
         "model": "singularity-host-development",

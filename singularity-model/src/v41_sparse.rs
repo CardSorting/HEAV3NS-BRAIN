@@ -40,6 +40,39 @@ pub fn index_scores(
         .collect())
 }
 
+/// Checkpoint indexer scoring with BF16 einsum, multiply and reduction output
+/// boundaries, while accumulating dot products and reductions in FP32.
+pub fn index_scores_bf16(
+    q: &[f32],
+    keys: &[f32],
+    weights: &[f32],
+    dim: usize,
+) -> Result<Vec<f32>, SingularityError> {
+    if dim == 0
+        || weights.is_empty()
+        || weights.len().checked_mul(dim) != Some(q.len())
+        || keys.len() % dim != 0
+        || q.iter().chain(keys).chain(weights).any(|x| !x.is_finite())
+    {
+        return Err(error("Invalid sparse indexer input"));
+    }
+    Ok(keys
+        .chunks_exact(dim)
+        .map(|key| {
+            let sum: f32 = q
+                .chunks_exact(dim)
+                .zip(weights)
+                .map(|(query, &weight)| {
+                    let dot: f32 = query.iter().zip(key).map(|(a, b)| a * b).sum();
+                    let dot = bf16::from_f32(dot).to_f32().max(0.0);
+                    bf16::from_f32(dot * weight).to_f32()
+                })
+                .sum();
+            bf16::from_f32(sum).to_f32()
+        })
+        .collect())
+}
+
 /// Candidate blocks ranked by maximum score, with the newest reachable block
 /// pinned. Ties use ascending block ID; accelerator top-k tie order may differ.
 pub fn candidate_blocks(
@@ -84,8 +117,10 @@ pub fn candidate_blocks(
     Ok(selected)
 }
 
-/// Select reachable compressed positions, sorted into position order. `None`
-/// represents padding and offset maps compressed slots into the combined KV.
+/// Select compressed positions, sorted into position order. Masked candidates
+/// score negative infinity but can still be selected when fewer than top-k
+/// positions survive. Only selected positions beyond `reachable` become `None`.
+/// Equal scores use ascending IDs; accelerator top-k tie order can differ.
 pub fn compressed_topk(
     scores: &[f32],
     reachable: usize,
@@ -100,21 +135,29 @@ pub fn compressed_topk(
         return Err(error("Invalid compressed top-k input"));
     }
     let width = top_k.min(scores.len());
-    let mut valid: Vec<usize> = (0..reachable)
-        .filter(|&i| candidate_mask.is_none_or(|m| m[i]) && scores[i] != f32::NEG_INFINITY)
-        .collect();
-    valid.sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]).then(a.cmp(&b)));
-    valid.truncate(width);
-    valid.sort_unstable();
+    let score = |index: usize| {
+        if index >= reachable || candidate_mask.is_some_and(|mask| !mask[index]) {
+            f32::NEG_INFINITY
+        } else {
+            scores[index]
+        }
+    };
+    let mut selected: Vec<usize> = (0..scores.len()).collect();
+    selected.sort_unstable_by(|&a, &b| score(b).total_cmp(&score(a)).then(a.cmp(&b)));
+    selected.truncate(width);
+    selected.sort_unstable();
     let mut out = Vec::with_capacity(width);
-    for index in valid {
-        out.push(Some(
-            index
-                .checked_add(offset)
-                .ok_or_else(|| error("Compressed index overflow"))?,
-        ));
+    for index in selected {
+        out.push(if index < reachable {
+            Some(
+                index
+                    .checked_add(offset)
+                    .ok_or_else(|| error("Compressed index overflow"))?,
+            )
+        } else {
+            None
+        });
     }
-    out.resize(width, None);
     Ok(out)
 }
 
@@ -157,6 +200,7 @@ pub fn decode_window_indices(
 
 /// Single-sequence ring cache for the uncompressed sliding-window KV.
 /// Each append writes the next causal position and returns physical indices.
+#[derive(Clone)]
 pub struct WindowCache {
     window: usize,
     dim: usize,
@@ -264,8 +308,75 @@ pub fn sparse_attention(
     Ok(out)
 }
 
+/// CPU transcription of the checkpoint kernel's 64-position online softmax,
+/// including BF16 probability rounding before the value product.
+pub fn sparse_attention_kernel_reference(
+    q: &[f32],
+    kv: &[f32],
+    sink: &[f32],
+    indices: &[Option<usize>],
+    dim: usize,
+    scale: f32,
+) -> Result<Vec<f32>, SingularityError> {
+    if dim == 0
+        || sink.is_empty()
+        || sink.len().checked_mul(dim) != Some(q.len())
+        || kv.len() % dim != 0
+        || !scale.is_finite()
+        || q.iter().chain(kv).chain(sink).any(|x| !x.is_finite())
+        || indices.iter().flatten().any(|&i| i >= kv.len() / dim)
+    {
+        return Err(error("Invalid sparse attention input"));
+    }
+    let mut output = vec![0.0; q.len()];
+    for (head, query) in q.chunks_exact(dim).enumerate() {
+        let mut max = -1e30f32;
+        let mut denom = 0.0f32;
+        let out = &mut output[head * dim..(head + 1) * dim];
+        for block in indices.chunks(64) {
+            let scores: Vec<f32> = block
+                .iter()
+                .map(|idx| match idx {
+                    Some(i) => {
+                        query
+                            .iter()
+                            .zip(&kv[i * dim..(i + 1) * dim])
+                            .map(|(a, b)| a * b)
+                            .sum::<f32>()
+                            * scale
+                    }
+                    None => f32::NEG_INFINITY,
+                })
+                .collect();
+            let new_max = scores.iter().copied().fold(max, f32::max);
+            let rescale = (max - new_max).exp();
+            denom *= rescale;
+            for value in out.iter_mut() {
+                *value *= rescale;
+            }
+            for (&index, score) in block.iter().zip(scores) {
+                let probability = (score - new_max).exp();
+                denom += probability;
+                if let Some(index) = index {
+                    let probability = bf16::from_f32(probability).to_f32();
+                    for j in 0..dim {
+                        out[j] += probability * kv[index * dim + j];
+                    }
+                }
+            }
+            max = new_max;
+        }
+        denom += (sink[head] - max).exp();
+        for value in out.iter_mut() {
+            *value = bf16::from_f32(*value / denom).to_f32();
+        }
+    }
+    Ok(output)
+}
+
 /// Stateful learned per-coordinate pooling of pre-projected KV and gate logits.
 /// The caller performs the projection, BF16 cast, RMSNorm, RoPE and quantization.
+#[derive(Clone)]
 pub struct CompressionPool {
     ratio: usize,
     dim: usize,
@@ -322,6 +433,54 @@ impl CompressionPool {
 mod tests {
     use super::*;
     use serde::Deserialize;
+
+    #[test]
+    fn bf16_index_scores_match_pytorch() {
+        #[derive(Deserialize)]
+        struct Scores {
+            q: Vec<f32>,
+            keys: Vec<f32>,
+            weights: Vec<f32>,
+            scores: Vec<f32>,
+        }
+        let v: Scores = serde_json::from_str(include_str!(
+            "../tests/fixtures/v41_index_score_vectors.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            index_scores_bf16(&v.q, &v.keys, &v.weights, 32).unwrap(),
+            v.scores
+        );
+    }
+
+    #[test]
+    fn online_sparse_attention_matches_pytorch_across_blocks() {
+        #[derive(Deserialize)]
+        struct Oracle {
+            q: Vec<f32>,
+            kv: Vec<f32>,
+            sink: Vec<f32>,
+            indices: Vec<Option<usize>>,
+            output: Vec<f32>,
+        }
+        let v: Oracle = serde_json::from_str(include_str!(
+            "../tests/fixtures/v41_sparse_kernel_vectors.json"
+        ))
+        .unwrap();
+        let output = sparse_attention_kernel_reference(
+            &v.q,
+            &v.kv,
+            &v.sink,
+            &v.indices,
+            32,
+            32f32.sqrt().recip(),
+        )
+        .unwrap();
+        assert_eq!(output, v.output);
+        let empty =
+            sparse_attention_kernel_reference(&v.q, &v.kv, &v.sink, &[None], 32, 1.0).unwrap();
+        assert!(empty.iter().all(|&v| v == 0.0));
+    }
     #[derive(Deserialize)]
     struct Vectors {
         index: Vec<f32>,
@@ -389,6 +548,23 @@ mod tests {
         assert_eq!(
             compressed_topk(&scores, 2, None, 4, 10).unwrap(),
             [Some(10), Some(11), None, None]
+        );
+        // The checkpoint's top-k still returns masked-but-reachable positions
+        // when the candidate set contains fewer entries than the requested k.
+        assert_eq!(
+            compressed_topk(
+                &scores[..5],
+                4,
+                Some(&[false, false, true, false, false]),
+                3,
+                10
+            )
+            .unwrap(),
+            [Some(10), Some(11), Some(12)]
+        );
+        assert_eq!(
+            compressed_topk(&scores[..5], 1, Some(&[false; 5]), 3, 10).unwrap(),
+            [Some(10), None, None]
         );
         assert!(candidate_blocks(&scores, 11, 3, 2).is_err());
     }

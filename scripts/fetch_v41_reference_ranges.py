@@ -71,6 +71,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path, help="directory for verified reference bytes")
     parser.add_argument("--engram-projection", action="store_true", help="also fetch 150 MiB of layer-14 projection weights for the full Engram component test")
+    parser.add_argument("--compressor", action="store_true", help="also fetch the 10 MiB layer-2 compressor reference range")
+    parser.add_argument("--indexer", action="store_true", help="also fetch the layer-2 indexer reference ranges")
+    parser.add_argument("--aligner", action="store_true", help="also fetch 140 MiB of checkpoint vision aligner weights")
     args = parser.parse_args()
     args.directory.mkdir(parents=True, exist_ok=True)
     for name, (start, end, expected) in RANGES.items():
@@ -80,6 +83,14 @@ def main():
     if args.engram_projection:
         for name, (start, end, expected) in ENGRAM_PROJECTION.items():
             fetch(args.directory, name, start, end, expected, shard=48)
+    if args.compressor:
+        fetch(args.directory, "compressor-layer2.bin", 4194808, 14681591, "7d5b93e38f6a67fa63f13f06815b090247cfa13272ae27f5de97fc787e88667d", shard=5)
+    if args.indexer:
+        fetch(args.directory, "indexer-proj.bin", 14681592, 15140599, "28acb1dd040d4cf68be46b735e2e84ab14bccf6d1ad0bfeeb4011cb1e6fa20fc", shard=5)
+        fetch(args.directory, "indexer-scale.bin", 19096824, 19101943, "63f7c8035fc839273c2db3daa8ba94fcad1f6e321ff8e5b4d82b6e3a8d682631", shard=5)
+        fetch(args.directory, "indexer-query.bin", 443933432, 449176311, "316fe279230fdfde74c744cbaf7416f34ba913a3c7aeaa72a2f57ae8a4d189c5", shard=5)
+    if args.aligner:
+        fetch(args.directory, "aligner.bin", 27384, 146848503, "5929ee263ea80174c86266f366ef2d5b3a935b4ee313fe5daa19afa7f453b2e4", shard=1)
     print("Set SINGULARITY_V41_GATE_WEIGHT, SINGULARITY_V41_GATE_BIAS, SINGULARITY_V41_EXPERT_WEIGHT, and SINGULARITY_V41_EXPERT_SCALE to the corresponding files before running the ignored real-expert test.")
 
 if __name__ == "__main__":

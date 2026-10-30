@@ -23,12 +23,14 @@ use uuid::Uuid;
 static SEQ_ID_GEN: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ChatCompletionRequest {
     pub model: String,
     pub messages: Vec<ChatMessage>,
@@ -141,6 +143,22 @@ pub async fn chat_completions_handler(
         return Err((
             StatusCode::NOT_FOUND,
             format!("Model '{}' is not available", req.model),
+        ));
+    }
+    if req
+        .messages
+        .iter()
+        .any(|message| !matches!(message.role.as_str(), "system" | "user" | "assistant"))
+    {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "The development model supports only system, user, and assistant messages".into(),
+        ));
+    }
+    if req.stop.as_ref().is_some_and(|stops| !stops.is_empty()) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "The development model does not support stop strings".into(),
         ));
     }
     // 1. Check Circuit Breaker

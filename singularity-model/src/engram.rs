@@ -12,7 +12,7 @@ fn error(reason: &str) -> SingularityError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EngramLayerLayout {
     pub layer_id: usize,
     /// In n-gram order (2..=max), then head order.
@@ -21,7 +21,7 @@ pub struct EngramLayerLayout {
     pub rows: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EngramLayout {
     pub max_ngram: usize,
     pub heads: usize,
@@ -196,6 +196,7 @@ pub const FLASH_1017_MULTIPLIERS: [[u64; 4]; 2] = [
 
 /// Per-sequence incremental hash state for the pinned Flash-1017 tokenizer.
 /// Stores only the n-gram lookback, and resets independently between requests.
+#[derive(Clone)]
 pub struct Flash1017HashState {
     layout: EngramLayout,
     token_map: std::sync::Arc<[u32]>,

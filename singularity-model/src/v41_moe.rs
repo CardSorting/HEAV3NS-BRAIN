@@ -76,6 +76,79 @@ pub struct Gate {
     pub route_scale: f32,
 }
 
+/// Local checkpoint-backed MoE inventory for a backbone layer.
+pub struct LoadedMoe<'a> {
+    pub gate: Gate,
+    pub experts: Vec<Option<Expert<'a>>>,
+    pub shared: Expert<'a>,
+}
+
+impl<'a> LoadedMoe<'a> {
+    pub fn load(
+        loader: &'a crate::SafetensorsMmapLoader,
+        layer: usize,
+        config: &crate::v41_config::TextConfig,
+    ) -> Result<Self, SingularityError> {
+        if layer >= config.num_hidden_layers || config.n_shared_experts != 1 {
+            return Err(error("Unsupported MoE layer or shared expert count"));
+        }
+        let prefix = format!("layers.{layer}.ffn");
+        Self::load_prefix(
+            loader,
+            &prefix,
+            config,
+            config.n_routed_experts,
+            config.num_experts_per_tok,
+        )
+    }
+
+    pub fn load_draft(
+        loader: &'a crate::SafetensorsMmapLoader,
+        stage: usize,
+        config: &crate::v41_config::TextConfig,
+    ) -> Result<Self, SingularityError> {
+        if stage >= config.num_nextn_predict_layers || config.n_shared_experts != 1 {
+            return Err(error("Unsupported DSpark MoE stage"));
+        }
+        Self::load_prefix(
+            loader,
+            &format!("mtp.{stage}.ffn"),
+            config,
+            config.dspark_n_routed_experts,
+            config.dspark_num_experts_per_tok,
+        )
+    }
+
+    fn load_prefix(
+        loader: &'a crate::SafetensorsMmapLoader,
+        prefix: &str,
+        config: &crate::v41_config::TextConfig,
+        count: usize,
+        top_k: usize,
+    ) -> Result<Self, SingularityError> {
+        let gate = Gate::load_params(loader, &format!("{prefix}.gate"), config, count, top_k)?;
+        let expert = |name: &str, routed| {
+            Expert::load(
+                loader,
+                name,
+                config.hidden_size,
+                config.moe_intermediate_size,
+                config.swiglu_limit,
+                routed,
+            )
+        };
+        let shared = expert(&format!("{prefix}.shared_experts"), false)?;
+        let experts = (0..count)
+            .map(|i| expert(&format!("{prefix}.experts.{i}"), true).map(Some))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            gate,
+            experts,
+            shared,
+        })
+    }
+}
+
 impl Gate {
     /// Load checkpoint BF16 gate matrix and FP32 selection biases.
     pub fn load(
@@ -83,10 +156,29 @@ impl Gate {
         prefix: &str,
         config: &crate::v41_config::TextConfig,
     ) -> Result<Self, SingularityError> {
-        if config.scoring_func != "sqrtsoftplus" || config.topk_method != "noaux_tc" {
+        Self::load_params(
+            loader,
+            prefix,
+            config,
+            config.n_routed_experts,
+            config.num_experts_per_tok,
+        )
+    }
+    fn load_params(
+        loader: &crate::SafetensorsMmapLoader,
+        prefix: &str,
+        config: &crate::v41_config::TextConfig,
+        n: usize,
+        top_k: usize,
+    ) -> Result<Self, SingularityError> {
+        if config.scoring_func != "sqrtsoftplus"
+            || config.topk_method != "noaux_tc"
+            || n == 0
+            || top_k == 0
+            || top_k > n
+        {
             return Err(error("Unsupported V4.1 gate scoring configuration"));
         }
-        let n = config.n_routed_experts;
         let d = config.hidden_size;
         let load =
             |suffix: &str, dtype: &str, shape: &[usize]| -> Result<Vec<f32>, SingularityError> {
@@ -123,7 +215,7 @@ impl Gate {
             weights,
             bias,
             image_bias,
-            top_k: config.num_experts_per_tok,
+            top_k,
             normalize: config.norm_topk_prob,
             route_scale: config.routed_scaling_factor,
         })

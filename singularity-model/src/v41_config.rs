@@ -9,6 +9,7 @@ pub struct V41Config {
     pub model_type: String,
     pub architectures: Vec<String>,
     pub dtype: String,
+    pub image_token_id: u32,
     pub quantization_config: QuantizationConfig,
     pub text_config: TextConfig,
     pub vision_config: VisionConfig,
@@ -25,7 +26,20 @@ pub struct QuantizationConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct TextConfig {
+    pub vocab_size: usize,
+    pub max_position_embeddings: usize,
     pub hidden_size: usize,
+    pub num_attention_heads: usize,
+    pub head_dim: usize,
+    pub q_lora_rank: usize,
+    pub o_lora_rank: usize,
+    pub o_groups: usize,
+    pub sliding_window: usize,
+    pub index_n_heads: usize,
+    pub index_head_dim: usize,
+    pub index_topk: usize,
+    pub candidate_topk_blocks: usize,
+    pub candidate_block_size: usize,
     pub num_hidden_layers: usize,
     pub num_nextn_predict_layers: usize,
     pub compress_ratios: Vec<usize>,
@@ -57,6 +71,11 @@ pub struct TextConfig {
     pub compress_rope_theta: f32,
     pub rope_scaling: Option<RopeScaling>,
     pub dspark_target_layer_ids: Vec<usize>,
+    pub dspark_block_size: usize,
+    pub dspark_noise_token_id: u32,
+    pub dspark_markov_rank: usize,
+    pub dspark_n_routed_experts: usize,
+    pub dspark_num_experts_per_tok: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -72,6 +91,14 @@ pub struct RopeScaling {
 pub struct VisionConfig {
     pub num_hidden_layers: usize,
     pub hidden_size: usize,
+    pub num_attention_heads: usize,
+    pub intermediate_size: usize,
+    pub patch_size: usize,
+    pub rope_theta: f32,
+    pub downsample_ratio: usize,
+    pub max_image_tokens: usize,
+    pub min_pixels: usize,
+    pub max_wh_ratio: Option<usize>,
 }
 
 impl V41Config {
@@ -129,6 +156,37 @@ impl V41Config {
             .is_some_and(|i| i >= t.num_hidden_layers)
         {
             return Err(fail("Invalid V4.1 candidate source layer"));
+        }
+        if t.num_nextn_predict_layers > 0
+            && (t.dspark_block_size == 0
+                || t.dspark_markov_rank == 0
+                || t.dspark_target_layer_ids.is_empty()
+                || t.dspark_noise_token_id as usize >= t.vocab_size
+                || t.dspark_n_routed_experts == 0
+                || t.dspark_num_experts_per_tok == 0
+                || t.dspark_num_experts_per_tok > t.dspark_n_routed_experts
+                || t.compress_ratios[t.num_hidden_layers..]
+                    .iter()
+                    .any(|&ratio| ratio != 0))
+        {
+            return Err(fail("Invalid DSpark topology"));
+        }
+        let vision = &self.vision_config;
+        if vision.num_hidden_layers > 0
+            && (vision.hidden_size == 0
+                || vision.num_attention_heads == 0
+                || vision.hidden_size % vision.num_attention_heads != 0
+                || (vision.hidden_size / vision.num_attention_heads) % 4 != 0
+                || vision.intermediate_size == 0
+                || vision.patch_size == 0
+                || vision.downsample_ratio == 0
+                || vision.max_image_tokens < 4
+                || vision.max_wh_ratio == Some(0)
+                || !vision.rope_theta.is_finite()
+                || vision.rope_theta <= 1.0
+                || self.image_token_id as usize >= t.vocab_size)
+        {
+            return Err(fail("Invalid V4.1 vision configuration"));
         }
         Ok(())
     }

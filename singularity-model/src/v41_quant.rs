@@ -47,6 +47,57 @@ pub fn e2m1fn(nibble: u8) -> f32 {
     }
 }
 
+/// In-place FP4 activation quantization as used by compressed KV and indexer
+/// paths. Input and output use BF16 boundaries; scales are per group of 16
+/// (E4M3) for compressed KV or 32 (UE8M0) for the indexer.
+pub fn fp4_activation_dequant(
+    input: &[f32],
+    e4m3_scale: bool,
+) -> Result<Vec<f32>, SingularityError> {
+    let block = if e4m3_scale { 16 } else { 32 };
+    if input.is_empty() || input.len() % block != 0 {
+        return Err(error("Invalid FP4 activation dimensions"));
+    }
+    let mut output = Vec::with_capacity(input.len());
+    for group in input.chunks_exact(block) {
+        let values: Vec<f32> = group.iter().map(|&v| bf16::from_f32(v).to_f32()).collect();
+        if values.iter().any(|v| !v.is_finite()) {
+            return Err(error("Non-finite FP4 activation"));
+        }
+        let amax = values.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+        let scale = if e4m3_scale {
+            e4m3fn(encode_e4m3fn(amax.max(6.0 * 2.0f32.powi(-9)) / 6.0)?)
+        } else {
+            let value = amax.max(6.0 * 2.0f32.powi(-126)) * (1.0 / 6.0);
+            let bits = value.to_bits();
+            let exp = ((bits >> 23) & 255) + u32::from(bits & 0x7fffff != 0);
+            if !(1..=254).contains(&exp) {
+                return Err(error("FP4 activation scale outside UE8M0 range"));
+            }
+            ue8m0(exp as u8)
+        };
+        for value in values {
+            let normalized = (value.abs() / scale).min(6.0);
+            let mut best = 0u8;
+            let mut distance = f32::INFINITY;
+            for candidate in 0..8u8 {
+                let d = (normalized - e2m1fn(candidate)).abs();
+                if d < distance || (d == distance && candidate % 2 == 0 && best % 2 != 0) {
+                    best = candidate;
+                    distance = d;
+                }
+            }
+            let signed = if value.is_sign_negative() {
+                -e2m1fn(best)
+            } else {
+                e2m1fn(best)
+            };
+            output.push(bf16::from_f32(signed * scale).to_f32());
+        }
+    }
+    Ok(output)
+}
+
 /// Round a finite value to E4M3FN, nearest with ties to even, saturating to 448.
 pub fn encode_e4m3fn(value: f32) -> Result<u8, SingularityError> {
     if !value.is_finite() {
@@ -339,6 +390,22 @@ pub fn expert_fp4_matvec(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fp4_activation_rounding_scales_and_zero_groups() {
+        let mut values = vec![0.0; 32];
+        values[..8].copy_from_slice(&[6.0, 0.25, 0.75, 1.25, 1.75, 2.5, 3.5, -5.0]);
+        let out = fp4_activation_dequant(&values, false).unwrap();
+        assert_eq!(&out[..8], &[6.0, 0.0, 1.0, 1.0, 2.0, 2.0, 4.0, -4.0]);
+        assert!(out[8..].iter().all(|x| *x == 0.0));
+        let mut kv = vec![0.0; 16];
+        kv[0] = 3.0;
+        kv[1] = 0.375;
+        let result = fp4_activation_dequant(&kv, true).unwrap();
+        assert_eq!(result[0], 3.0);
+        assert_eq!(result[1], 0.5);
+        assert!(fp4_activation_dequant(&[0.0; 15], true).is_err());
+    }
     use serde::Deserialize;
 
     #[derive(Deserialize)]

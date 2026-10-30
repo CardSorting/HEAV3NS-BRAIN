@@ -17,6 +17,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Run experimental, single-sequence V4.1 CPU reference inference offline
+    V41Reference {
+        /// Path to the complete checkpoint directory or safetensors index
+        #[arg(long)]
+        model_path: PathBuf,
+        /// Path to the pinned checkpoint config.json
+        #[arg(long)]
+        config_path: PathBuf,
+        /// Path to the pinned checkpoint tokenizer.json
+        #[arg(long)]
+        tokenizer_path: PathBuf,
+        /// JSON file containing messages, optional tools, mode, effort and max_new_tokens
+        #[arg(long)]
+        request_path: PathBuf,
+        /// Enable sequentially verified DSpark drafts (correctness reference; no speedup)
+        #[arg(long)]
+        dspark: bool,
+    },
     /// Start the OpenAI-compatible REST & SSE inference server
     Serve {
         #[arg(long, default_value = "0.0.0.0")]
@@ -70,6 +88,29 @@ enum Commands {
     },
 }
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReferenceRequest {
+    messages: Vec<singularity_model::v41_openai::MessageInput>,
+    #[serde(default)]
+    tools: Vec<singularity_model::v41_openai::ToolDefinition>,
+    #[serde(default = "reference_mode")]
+    mode: singularity_model::v41_prompt::ThinkingMode,
+    #[serde(default = "reference_effort")]
+    effort: u8,
+    #[serde(default = "reference_max_tokens")]
+    max_new_tokens: usize,
+}
+fn reference_mode() -> singularity_model::v41_prompt::ThinkingMode {
+    singularity_model::v41_prompt::ThinkingMode::Chat
+}
+fn reference_effort() -> u8 {
+    75
+}
+fn reference_max_tokens() -> usize {
+    32
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -82,6 +123,108 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
+        Commands::V41Reference {
+            model_path,
+            config_path,
+            tokenizer_path,
+            request_path,
+            dspark,
+        } => {
+            let request: ReferenceRequest =
+                serde_json::from_reader(std::fs::File::open(request_path)?)?;
+            if request.max_new_tokens == 0 {
+                return Err("max_new_tokens must be positive".into());
+            }
+            let config = singularity_model::v41_config::V41Config::load(config_path)?;
+            let tokenizer = singularity_model::TokenizerWrapper::from_v41_file(tokenizer_path)?;
+            let prompt = singularity_model::v41_openai::encode(
+                &request.messages,
+                &request.tools,
+                request.mode,
+                request.effort,
+            )?;
+            let tokens = tokenizer.encode(&prompt)?;
+            let max_length = tokens
+                .len()
+                .checked_add(request.max_new_tokens)
+                .ok_or("Sequence length overflow")?;
+            let required_length = if dspark {
+                max_length
+                    .checked_add(config.text_config.dspark_block_size)
+                    .ok_or("Sequence length overflow")?
+            } else {
+                max_length
+            };
+            if tokens.is_empty() || required_length > config.text_config.max_position_embeddings {
+                return Err("Requested sequence exceeds checkpoint context length".into());
+            }
+            eprintln!("Experimental CPU reference: full checkpoint required; execution may be extremely slow and is not production inference.");
+            let token_map =
+                tokenizer.v41_engram_map(config.text_config.engram_compressed_vocab_size)?;
+            let loader = singularity_model::SafetensorsMmapLoader::open(model_path)?;
+            let mut model = singularity_model::v41_model::TextModel::load(
+                &loader,
+                &config.text_config,
+                Some(token_map.into()),
+                2,
+            )?;
+            let (generated, dspark_stats) = if dspark {
+                let io = singularity_model::v41_io::TokenIo::load(&loader, &config.text_config)?;
+                let mut draft =
+                    singularity_model::v41_dspark::DraftModel::load(&loader, &config.text_config)?;
+                let result = singularity_model::v41_dspark::generate_verified_greedy(
+                    &mut model,
+                    &mut draft,
+                    &io,
+                    &tokens,
+                    request.max_new_tokens,
+                    tokenizer.eos_token(),
+                )?;
+                (
+                    result.tokens,
+                    Some(
+                        serde_json::json!({"proposed":result.proposed,"accepted":result.accepted}),
+                    ),
+                )
+            } else {
+                (
+                    model.generate_greedy(
+                        &tokens,
+                        request.max_new_tokens,
+                        tokenizer.eos_token(),
+                    )?,
+                    None,
+                )
+            };
+            let output = tokenizer.decode(&generated)?;
+            let ended = generated.last() == Some(&tokenizer.eos_token());
+            let message = if ended {
+                let parsed = singularity_model::v41_tools::parse_completion(&output, request.mode)?;
+                let ids = (0..parsed.calls.len())
+                    .map(|i| format!("call_ref_{i}"))
+                    .collect::<Vec<_>>();
+                Some(singularity_model::v41_openai::decode(
+                    &output,
+                    request.mode,
+                    &ids,
+                )?)
+            } else {
+                None
+            };
+            let finish_reason = if !ended {
+                "length"
+            } else if message.as_ref().is_some_and(|m| !m.tool_calls.is_empty()) {
+                "tool_calls"
+            } else {
+                "stop"
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &serde_json::json!({"prompt_tokens":tokens.len(),"completion_tokens":generated,"finish_reason":finish_reason,"text":output,"message":message,"dspark":dspark_stats})
+                )?
+            );
+        }
         Commands::Serve {
             host,
             port,

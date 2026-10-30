@@ -14,6 +14,16 @@ impl Default for TokenizerWrapper {
 }
 
 impl TokenizerWrapper {
+    /// Build the checkpoint's Engram token compression map from this tokenizer.
+    pub fn v41_engram_map(&self, expected_size: usize) -> Result<Vec<u32>, SingularityError> {
+        let tokenizer = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| SingularityError::ModelError {
+                reason: "Engram requires a checkpoint tokenizer".into(),
+            })?;
+        crate::engram::compressed_vocabulary(tokenizer, expected_size)
+    }
     /// Load the V4.1 tokenizer with explicit checkpoint special-token IDs.
     pub fn from_v41_file<P: AsRef<Path>>(path: P) -> Result<Self, SingularityError> {
         let p = path.as_ref();

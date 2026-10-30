@@ -7,6 +7,72 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 
+/// Parse JSON while rejecting duplicate keys at every nesting level. A normal
+/// serde_json::Value silently overwrites duplicates, hiding corrupt inventories.
+struct StrictJson(serde_json::Value);
+impl<'de> Deserialize<'de> for StrictJson {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = StrictJson;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("JSON without duplicate object keys")
+            }
+            fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+                Ok(StrictJson(v.into()))
+            }
+            fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+                Ok(StrictJson(v.into()))
+            }
+            fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+                Ok(StrictJson(v.into()))
+            }
+            fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+                serde_json::Number::from_f64(v)
+                    .map(|n| StrictJson(n.into()))
+                    .ok_or_else(|| E::custom("Non-finite JSON number"))
+            }
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                Ok(StrictJson(v.into()))
+            }
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                Ok(StrictJson(v.into()))
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(StrictJson(serde_json::Value::Null))
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+                Ok(StrictJson(serde_json::Value::Null))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = Vec::new();
+                while let Some(StrictJson(v)) = seq.next_element()? {
+                    values.push(v);
+                }
+                Ok(StrictJson(values.into()))
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut values = serde_json::Map::new();
+                while let Some((key, StrictJson(value))) = map.next_entry::<String, StrictJson>()? {
+                    if values.insert(key.clone(), value).is_some() {
+                        return Err(serde::de::Error::custom(format!(
+                            "Duplicate JSON key '{key}'"
+                        )));
+                    }
+                }
+                Ok(StrictJson(values.into()))
+            }
+        }
+        deserializer.deserialize_any(Visitor)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorInfo {
     pub dtype: String,
@@ -104,7 +170,8 @@ impl SafetensorsMmapLoader {
 
     fn open_index(index_path: &Path) -> Result<Self, SingularityError> {
         let file = File::open(index_path)?;
-        let manifest: IndexManifest = serde_json::from_reader(file)?;
+        let StrictJson(root) = serde_json::from_reader(file)?;
+        let manifest: IndexManifest = serde_json::from_value(root)?;
         let parent_dir = index_path.parent().unwrap_or_else(|| Path::new("."));
 
         // Collect unique shard filenames in order
@@ -200,7 +267,7 @@ impl SafetensorsMmapLoader {
         }
 
         let header_bytes = &mmap[8..header_end];
-        let root: serde_json::Value = serde_json::from_slice(header_bytes)?;
+        let StrictJson(root) = serde_json::from_slice(header_bytes)?;
         let obj = root
             .as_object()
             .ok_or_else(|| SingularityError::ModelError {
@@ -214,6 +281,27 @@ impl SafetensorsMmapLoader {
         for (k, v) in obj {
             if k != "__metadata__" {
                 let info: TensorInfo = serde_json::from_value(v.clone())?;
+                let width = match info.dtype.as_str() {
+                    "BOOL" | "U8" | "I8" | "F8_E4M3" | "F8_E5M2" | "F8_E8M0" => 1usize,
+                    "I16" | "U16" | "F16" | "BF16" => 2,
+                    "I32" | "U32" | "F32" => 4,
+                    "I64" | "U64" | "F64" => 8,
+                    _ => {
+                        return Err(SingularityError::ModelError {
+                            reason: format!("Unsupported dtype '{}' for tensor '{k}'", info.dtype),
+                        })
+                    }
+                };
+                let expected = info
+                    .shape
+                    .iter()
+                    .try_fold(width, |n, dim| n.checked_mul(*dim));
+                let actual = info.data_offsets.1.checked_sub(info.data_offsets.0);
+                if expected.is_none() || expected != actual {
+                    return Err(SingularityError::ModelError {
+                        reason: format!("Invalid payload size for tensor '{k}'"),
+                    });
+                }
                 tensors.insert(k.clone(), info);
             }
         }
@@ -473,11 +561,69 @@ mod tests {
         );
         assert!(SafetensorsMmapLoader::open(&shard).is_err());
         write_shard(
+            r#"{"x":{"dtype":"F32","shape":[2],"data_offsets":[0,4]}}"#,
+            &[0; 4],
+        );
+        assert!(SafetensorsMmapLoader::open(&shard).is_err());
+        write_shard(
+            r#"{"x":{"dtype":"UNKNOWN","shape":[4],"data_offsets":[0,4]}}"#,
+            &[0; 4],
+        );
+        assert!(SafetensorsMmapLoader::open(&shard).is_err());
+        write_shard(
             r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
             &[0; 4],
         );
         let index = dir.path().join("model.safetensors.index.json");
         std::fs::write(&index, r#"{"weight_map":{"missing":"model.safetensors"}}"#).unwrap();
         assert!(SafetensorsMmapLoader::open(&index).is_err());
+    }
+
+    #[test]
+    fn rejects_duplicate_tensor_and_manifest_keys() {
+        let dir = tempdir().unwrap();
+        let shard = dir.path().join("model.safetensors");
+        let write_header = |header: &str| {
+            let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+            bytes.extend_from_slice(header.as_bytes());
+            bytes.extend_from_slice(&[0; 4]);
+            std::fs::write(&shard, bytes).unwrap();
+        };
+        write_header(
+            r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]},"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#,
+        );
+        assert!(SafetensorsMmapLoader::open(&shard).is_err());
+        write_header(r#"{"x":{"dtype":"F32","dtype":"I32","shape":[1],"data_offsets":[0,4]}}"#);
+        assert!(SafetensorsMmapLoader::open(&shard).is_err());
+        write_header(r#"{"x":{"dtype":"F32","shape":[1],"data_offsets":[0,4]}}"#);
+        let index = dir.path().join("model.safetensors.index.json");
+        std::fs::write(
+            &index,
+            r#"{"weight_map":{"x":"model.safetensors","x":"model.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(SafetensorsMmapLoader::open(index).is_err());
+    }
+
+    #[test]
+    #[ignore = "requires SINGULARITY_V41_INDEX pointing to the pinned checkpoint index"]
+    fn strict_index_parses_pinned_checkpoint_inventory() {
+        use sha2::{Digest, Sha256};
+        let bytes = std::fs::read(std::env::var("SINGULARITY_V41_INDEX").unwrap()).unwrap();
+        assert_eq!(
+            format!("{:x}", Sha256::digest(&bytes)),
+            "74b0686a3d2891980d5e303251b075a3bccae2c2ff650747db2620a649b98fa8"
+        );
+        let StrictJson(root) = serde_json::from_slice(&bytes).unwrap();
+        let manifest: IndexManifest = serde_json::from_value(root).unwrap();
+        assert_eq!(manifest.weight_map.len(), 96085);
+        assert_eq!(
+            manifest.weight_map.values().collect::<HashSet<_>>().len(),
+            48
+        );
+        assert_eq!(
+            manifest.metadata["total_size"].as_u64(),
+            Some(510_286_023_000)
+        );
     }
 }

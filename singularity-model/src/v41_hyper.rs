@@ -34,6 +34,7 @@ pub struct HcMix {
 }
 
 /// Residual streams and the shifted pre-mix used by the next sublayer.
+#[derive(Clone)]
 pub struct HcState {
     pub residual: Vec<f32>,
     pub next_pre: Vec<f32>,
