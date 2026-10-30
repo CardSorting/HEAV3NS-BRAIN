@@ -43,3 +43,4 @@ Have you considered alternative approaches? Why were they rejected?
 ## Additional Context
 
 Links to papers, reference implementations, or prior art.
+

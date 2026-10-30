@@ -47,3 +47,4 @@ What actually happened? Paste the full panic/error output below.
 ## Additional Context
 
 Any other context, logs, or screenshots that may be helpful.
+

@@ -83,3 +83,4 @@ The following are **not** considered security vulnerabilities for this project:
 ## Acknowledgements
 
 We thank all security researchers who responsibly disclose vulnerabilities. Contributors who report valid issues will be acknowledged in the release notes (with their permission).
+

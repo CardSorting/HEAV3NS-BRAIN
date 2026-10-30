@@ -205,3 +205,4 @@ All new features require at least one accompanying test. Performance-sensitive p
 | `singularity-tests` | E2E harness, Criterion benchmarks |
 
 When adding a new crate, register it in the root `Cargo.toml` workspace `members` array.
+
