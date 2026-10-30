@@ -1,0 +1,29 @@
+[package]
+name = "singularity-cli"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "singularity"
+path = "src/main.rs"
+
+[features]
+default = []
+cuda = ["singularity-cuda/cuda"]
+
+[dependencies]
+singularity-core = { workspace = true }
+singularity-cuda = { workspace = true }
+singularity-cache = { workspace = true }
+singularity-scheduler = { workspace = true }
+singularity-model = { workspace = true }
+singularity-grammar = { workspace = true }
+singularity-server = { workspace = true }
+axum = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde_json = { workspace = true }

@@ -1,0 +1,317 @@
+[
+  {
+    "name": "chat_simple",
+    "mode": "chat",
+    "effort": 75,
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are helpful."
+      },
+      {
+        "role": "user",
+        "content": "Hello!"
+      }
+    ],
+    "prompt": "<｜begin▁of▁sentence｜><｜System｜>You are helpful.<｜User｜>Hello!<｜Assistant｜></think>",
+    "token_ids": [
+      0,
+      128799,
+      3476,
+      477,
+      11502,
+      16,
+      128803,
+      19923,
+      3,
+      128804,
+      128822
+    ]
+  },
+  {
+    "name": "thinking_simple",
+    "mode": "thinking",
+    "effort": 75,
+    "messages": [
+      {
+        "role": "system",
+        "content": "You are helpful."
+      },
+      {
+        "role": "user",
+        "content": "你好！"
+      }
+    ],
+    "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\nYou are helpful.<｜User｜>你好！<｜Assistant｜><think>",
+    "token_ids": [
+      0,
+      128799,
+      77666,
+      288,
+      9504,
+      482,
+      28,
+      223,
+      2402,
+      343,
+      16801,
+      223,
+      19,
+      15,
+      1457,
+      14,
+      270,
+      4077,
+      270,
+      1990,
+      14,
+      270,
+      850,
+      15146,
+      270,
+      22805,
+      868,
+      3476,
+      477,
+      11502,
+      16,
+      128803,
+      30594,
+      1175,
+      128804,
+      128821
+    ]
+  },
+  {
+    "name": "multi_chat",
+    "mode": "chat",
+    "effort": 50,
+    "messages": [
+      {
+        "role": "user",
+        "content": "One?"
+      },
+      {
+        "role": "assistant",
+        "content": "First."
+      },
+      {
+        "role": "user",
+        "content": "Two?"
+      }
+    ],
+    "prompt": "<｜begin▁of▁sentence｜><｜User｜>One?<｜Assistant｜></think>First.<｜end▁of▁sentence｜><｜User｜>Two?<｜Assistant｜></think>",
+    "token_ids": [
+      0,
+      128803,
+      6111,
+      33,
+      128804,
+      128822,
+      10318,
+      16,
+      1,
+      128803,
+      14959,
+      33,
+      128804,
+      128822
+    ]
+  },
+  {
+    "name": "thinking_history",
+    "mode": "thinking",
+    "effort": 60,
+    "messages": [
+      {
+        "role": "user",
+        "content": "First?"
+      },
+      {
+        "role": "assistant",
+        "content": "Yes.",
+        "reasoning_content": "Thinking."
+      },
+      {
+        "role": "user",
+        "content": "Next?"
+      }
+    ],
+    "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 60 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>First?<｜Assistant｜></think>Yes.<｜end▁of▁sentence｜><｜User｜>Next?<｜Assistant｜><think>",
+    "token_ids": [
+      0,
+      128799,
+      77666,
+      288,
+      9504,
+      482,
+      28,
+      223,
+      1683,
+      343,
+      16801,
+      223,
+      19,
+      15,
+      1457,
+      14,
+      270,
+      4077,
+      270,
+      1990,
+      14,
+      270,
+      850,
+      15146,
+      270,
+      22805,
+      868,
+      128803,
+      10318,
+      33,
+      128804,
+      128822,
+      10240,
+      16,
+      1,
+      128803,
+      11534,
+      33,
+      128804,
+      128821
+    ]
+  },
+  {
+    "name": "thinking_mid_system",
+    "mode": "thinking",
+    "effort": 100,
+    "messages": [
+      {
+        "role": "user",
+        "content": "First?"
+      },
+      {
+        "role": "assistant",
+        "content": "OK",
+        "reasoning_content": "Prior"
+      },
+      {
+        "role": "system",
+        "content": "New instruction"
+      }
+    ],
+    "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 100 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>First?<｜Assistant｜></think>OK<｜end▁of▁sentence｜><｜System｜>New instruction<｜Assistant｜><think>",
+    "token_ids": [
+      0,
+      128799,
+      77666,
+      288,
+      9504,
+      482,
+      28,
+      223,
+      1457,
+      343,
+      16801,
+      223,
+      19,
+      15,
+      1457,
+      14,
+      270,
+      4077,
+      270,
+      1990,
+      14,
+      270,
+      850,
+      15146,
+      270,
+      22805,
+      868,
+      128803,
+      10318,
+      33,
+      128804,
+      128822,
+      11932,
+      1,
+      128799,
+      5840,
+      12740,
+      128804,
+      128821
+    ]
+  },
+  {
+    "name": "chat_system_only",
+    "mode": "chat",
+    "effort": 75,
+    "messages": [
+      {
+        "role": "system",
+        "content": "Instruction"
+      }
+    ],
+    "prompt": "<｜begin▁of▁sentence｜><｜System｜>Instruction",
+    "token_ids": [
+      0,
+      128799,
+      90860
+    ]
+  },
+  {
+    "name": "thinking_assistant_last",
+    "mode": "thinking",
+    "effort": 75,
+    "messages": [
+      {
+        "role": "user",
+        "content": "Hi"
+      },
+      {
+        "role": "assistant",
+        "content": "Hello",
+        "reasoning_content": "Simple"
+      }
+    ],
+    "prompt": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 75 (range 1-100, the higher the value, the more thorough the reasoning)\n\n<｜User｜>Hi<｜Assistant｜><think>Simple</think>Hello<｜end▁of▁sentence｜>",
+    "token_ids": [
+      0,
+      128799,
+      77666,
+      288,
+      9504,
+      482,
+      28,
+      223,
+      2402,
+      343,
+      16801,
+      223,
+      19,
+      15,
+      1457,
+      14,
+      270,
+      4077,
+      270,
+      1990,
+      14,
+      270,
+      850,
+      15146,
+      270,
+      22805,
+      868,
+      128803,
+      23166,
+      128804,
+      128821,
+      40593,
+      128822,
+      19923,
+      1
+    ]
+  }
+]

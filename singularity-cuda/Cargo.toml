@@ -1,0 +1,22 @@
+[package]
+name = "singularity-cuda"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+default = []
+cuda = ["dep:cudarc"]
+
+[dependencies]
+singularity-core = { workspace = true }
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+cudarc = { workspace = true, optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

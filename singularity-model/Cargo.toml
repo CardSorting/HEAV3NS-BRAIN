@@ -1,0 +1,23 @@
+[package]
+name = "singularity-model"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+singularity-core = { workspace = true }
+singularity-cuda = { workspace = true }
+singularity-cache = { workspace = true }
+memmap2.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+tokenizers = { workspace = true }
+half = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+sha2.workspace = true

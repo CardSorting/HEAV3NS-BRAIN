@@ -1,0 +1,34 @@
+[package]
+name = "singularity-tests"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[features]
+cuda = ["singularity-cuda/cuda"]
+
+[dependencies]
+singularity-core = { workspace = true }
+singularity-cuda = { workspace = true }
+singularity-cache = { workspace = true }
+singularity-scheduler = { workspace = true }
+singularity-model = { workspace = true }
+singularity-grammar = { workspace = true }
+singularity-server = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+axum = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+sha2.workspace = true
+
+[[bench]]
+name = "engine_benchmarks"
+harness = false

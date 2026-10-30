@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "singularity-core",
+    "singularity-cuda",
+    "singularity-cache",
+    "singularity-scheduler",
+    "singularity-model",
+    "singularity-grammar",
+    "singularity-server",
+    "singularity-cli",
+    "singularity-tests",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+authors = ["Project SINGULARITY Team <singularity@deepmind.internal>"]
+license = "Apache-2.0"
+
+[workspace.dependencies]
+singularity-core = { path = "singularity-core" }
+singularity-cuda = { path = "singularity-cuda" }
+singularity-cache = { path = "singularity-cache" }
+singularity-scheduler = { path = "singularity-scheduler" }
+singularity-model = { path = "singularity-model" }
+singularity-grammar = { path = "singularity-grammar" }
+singularity-server = { path = "singularity-server" }
+
+tokio = { version = "1", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+parking_lot = "0.12"
+thiserror = "1.0"
+uuid = { version = "=1.11.0", features = ["v4", "serde"] }
+sha2 = "0.10"
+clap = { version = "4", features = ["derive", "env"] }
+futures-util = "0.3"
+async-stream = "0.3"
+tempfile = "3.8"
+memmap2 = "0.9"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+criterion = { version = "0.5", features = ["async_tokio"] }
+libc = "0.2"
+half = { version = "2.4", features = ["serde"] }
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+cudarc = { version = "0.12", default-features = false, features = ["driver", "cublas", "cuda-12050"] }
