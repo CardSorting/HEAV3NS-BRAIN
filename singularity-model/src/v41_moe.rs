@@ -45,12 +45,16 @@ pub fn route_logits(
         })
         .collect();
     let mut order: Vec<usize> = (0..scores.len()).collect();
-    order.sort_unstable_by(|&a, &b| {
+    let cmp = |&a: &usize, &b: &usize| {
         (scores[b] + bias[b])
             .total_cmp(&(scores[a] + bias[a]))
             .then(a.cmp(&b))
-    });
-    order.truncate(top_k);
+    };
+    if top_k < order.len() {
+        order.select_nth_unstable_by(top_k - 1, cmp);
+        order.truncate(top_k);
+    }
+    order.sort_unstable_by(cmp);
     let sum: f32 = order.iter().map(|&i| scores[i]).sum();
     Ok(order
         .into_iter()
@@ -236,11 +240,18 @@ impl Gate {
         } else {
             &self.bias
         };
-        let logits: Vec<f32> = self
-            .weights
-            .chunks_exact(self.hidden)
-            .map(|row| row.iter().zip(input).map(|(w, x)| w * x).sum())
-            .collect();
+        let logits: Vec<f32> = if self.experts >= 64 {
+            use rayon::prelude::*;
+            self.weights
+                .par_chunks_exact(self.hidden)
+                .map(|row| row.iter().zip(input).map(|(w, x)| w * x).sum())
+                .collect()
+        } else {
+            self.weights
+                .chunks_exact(self.hidden)
+                .map(|row| row.iter().zip(input).map(|(w, x)| w * x).sum())
+                .collect()
+        };
         route_logits(&logits, bias, self.top_k, self.normalize, self.route_scale)
     }
 }
@@ -277,8 +288,10 @@ impl<'a> Expert<'a> {
             || [&w1, &w2, &w3].iter().any(|w| {
                 !matches!(
                     (routed, w),
-                    (true, CheckpointMatrix::Expert { .. })
-                        | (false, CheckpointMatrix::Dense { .. })
+                    (
+                        true,
+                        CheckpointMatrix::Expert { .. } | CheckpointMatrix::LazyExpert { .. }
+                    ) | (false, CheckpointMatrix::Dense { .. })
                 )
             })
         {
@@ -300,7 +313,7 @@ impl<'a> Expert<'a> {
         input: &[f32],
         routing_weight: Option<f32>,
     ) -> Result<Vec<f32>, SingularityError> {
-        self.forward_impl(input, routing_weight, false)
+        self.forward_impl(input, routing_weight, false, None)
     }
 
     /// Emulate the reference kernel's block-FP8 activation path on CPU.
@@ -309,7 +322,7 @@ impl<'a> Expert<'a> {
         input: &[f32],
         routing_weight: Option<f32>,
     ) -> Result<Vec<f32>, SingularityError> {
-        self.forward_impl(input, routing_weight, true)
+        self.forward_impl(input, routing_weight, true, None)
     }
 
     fn forward_impl(
@@ -317,6 +330,7 @@ impl<'a> Expert<'a> {
         input: &[f32],
         routing_weight: Option<f32>,
         quantized: bool,
+        shared_act: Option<&crate::v41_quant::QuantizedActivation>,
     ) -> Result<Vec<f32>, SingularityError> {
         if !self.swiglu_limit.is_finite()
             || self.swiglu_limit < 0.0
@@ -324,15 +338,31 @@ impl<'a> Expert<'a> {
         {
             return Err(error("Invalid expert parameters"));
         }
-        let matvec = |w: &CheckpointMatrix<'_>, x: &[f32]| {
-            if quantized {
-                w.matvec_quantized(x)
-            } else {
-                w.matvec(x)
-            }
+        let owned_act = if quantized && shared_act.is_none() {
+            Some(crate::v41_quant::quantize_activation_fp8(input)?)
+        } else {
+            None
         };
-        let gate = matvec(&self.w1, input)?;
-        let up = matvec(&self.w3, input)?;
+        let act_ref = shared_act.or(owned_act.as_ref());
+        let (gate_res, up_res) = if let Some(act) = act_ref {
+            if self.w1.shape().0 >= 64 {
+                rayon::join(
+                    || self.w1.matvec_quantized_with_activation(act),
+                    || self.w3.matvec_quantized_with_activation(act),
+                )
+            } else {
+                (
+                    self.w1.matvec_quantized_with_activation(act),
+                    self.w3.matvec_quantized_with_activation(act),
+                )
+            }
+        } else if self.w1.shape().0 >= 64 {
+            rayon::join(|| self.w1.matvec(input), || self.w3.matvec(input))
+        } else {
+            (self.w1.matvec(input), self.w3.matvec(input))
+        };
+        let gate = gate_res?;
+        let up = up_res?;
         if gate.len() != up.len() {
             return Err(error("Expert intermediate shape mismatch"));
         }
@@ -350,7 +380,11 @@ impl<'a> Expert<'a> {
                 bf16::from_f32(value).to_f32()
             })
             .collect();
-        let result = matvec(&self.w2, &hidden)?;
+        let result = if quantized {
+            self.w2.matvec_quantized(&hidden)?
+        } else {
+            self.w2.matvec(&hidden)?
+        };
         Ok(result
             .into_iter()
             .map(|x| bf16::from_f32(x).to_f32())
@@ -393,16 +427,17 @@ fn forward_single_impl(
         return Err(error("Expert inventory does not match gate"));
     }
     let routes = gate.route(input, image_token)?;
+    let shared_act = if quantized {
+        Some(crate::v41_quant::quantize_activation_fp8(input)?)
+    } else {
+        None
+    };
     let mut output = vec![0.0; gate.hidden];
     for route in &routes {
         let expert = experts[route.expert]
             .as_ref()
             .ok_or_else(|| error("Selected expert is not locally available"))?;
-        let value = if quantized {
-            expert.forward_quantized(input, Some(route.weight))?
-        } else {
-            expert.forward(input, Some(route.weight))?
-        };
+        let value = expert.forward_impl(input, Some(route.weight), quantized, shared_act.as_ref())?;
         if value.len() != output.len() {
             return Err(error("Expert output shape mismatch"));
         }
@@ -410,11 +445,7 @@ fn forward_single_impl(
             *sum += v;
         }
     }
-    let value = if quantized {
-        shared.forward_quantized(input, None)?
-    } else {
-        shared.forward(input, None)?
-    };
+    let value = shared.forward_impl(input, None, quantized, shared_act.as_ref())?;
     if value.len() != output.len() {
         return Err(error("Shared expert output shape mismatch"));
     }

@@ -51,16 +51,29 @@ impl<'a> Bf16Matrix<'a> {
         if input.len() != self.cols || input.iter().any(|x| !x.is_finite()) {
             return Err(error("Invalid compressor input"));
         }
-        let mut out = Vec::with_capacity(self.rows);
-        for row in self.data.chunks_exact(self.cols * 2) {
+        let compute = |row: &[u8]| -> f32 {
             let y: f32 = row
                 .chunks_exact(2)
                 .zip(input)
                 .map(|(v, x)| bf16::from_le_bytes([v[0], v[1]]).to_f32() * x)
                 .sum();
-            out.push(if round { bf16::from_f32(y).to_f32() } else { y });
+            if round {
+                bf16::from_f32(y).to_f32()
+            } else {
+                y
+            }
+        };
+        if self.rows >= 64 {
+            use rayon::prelude::*;
+            Ok(self
+                .data
+                .par_chunks_exact(self.cols * 2)
+                .with_min_len(64)
+                .map(compute)
+                .collect())
+        } else {
+            Ok(self.data.chunks_exact(self.cols * 2).map(compute).collect())
         }
-        Ok(out)
     }
 }
 

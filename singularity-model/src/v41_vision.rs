@@ -141,7 +141,7 @@ pub fn image_types(grid: ImageGrid) -> Result<Vec<TokenType>, SingularityError> 
     let mut types = Vec::with_capacity(grid.token_count()?);
     types.push(TokenType::ImageStart);
     for _ in 0..grid.llm_height {
-        types.extend(std::iter::repeat(TokenType::Image).take(grid.llm_width));
+        types.extend(std::iter::repeat_n(TokenType::Image, grid.llm_width));
         types.push(TokenType::ImageNewline);
     }
     types.push(TokenType::ImageEnd);
@@ -180,7 +180,7 @@ pub fn expand_image_tokens(
                 grid,
             });
             out.tokens
-                .extend(std::iter::repeat(image_token).take(types.len()));
+                .extend(std::iter::repeat_n(image_token, types.len()));
             out.types.extend(types);
         } else {
             out.tokens.push(token);
@@ -226,6 +226,74 @@ pub fn patchify_rgb(
         }
     }
     Ok(out)
+}
+
+/// Deterministically resize a row-major HWC RGB8 image to `(dst_width, dst_height)`
+/// using pixel-center bilinear interpolation.
+pub fn resize_rgb_bilinear(
+    rgb: &[u8],
+    src_width: usize,
+    src_height: usize,
+    dst_width: usize,
+    dst_height: usize,
+) -> Result<Vec<u8>, SingularityError> {
+    if src_width == 0 || src_height == 0 || dst_width == 0 || dst_height == 0 {
+        return Err(error("Invalid RGB resize dimensions"));
+    }
+    let expected = src_width
+        .checked_mul(src_height)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| error("Image size overflow"))?;
+    if rgb.len() != expected {
+        return Err(error("Invalid RGB payload size"));
+    }
+    if src_width == dst_width && src_height == dst_height {
+        return Ok(rgb.to_vec());
+    }
+    let out_len = dst_width
+        .checked_mul(dst_height)
+        .and_then(|n| n.checked_mul(3))
+        .ok_or_else(|| error("Image size overflow"))?;
+    let mut out = Vec::with_capacity(out_len);
+    for dy in 0..dst_height {
+        let sy = ((dy as f64 + 0.5) * (src_height as f64 / dst_height as f64) - 0.5)
+            .clamp(0.0, (src_height - 1) as f64);
+        let y0 = sy.floor() as usize;
+        let y1 = (y0 + 1).min(src_height - 1);
+        let wy = sy - y0 as f64;
+        for dx in 0..dst_width {
+            let sx = ((dx as f64 + 0.5) * (src_width as f64 / dst_width as f64) - 0.5)
+                .clamp(0.0, (src_width - 1) as f64);
+            let x0 = sx.floor() as usize;
+            let x1 = (x0 + 1).min(src_width - 1);
+            let wx = sx - x0 as f64;
+            for c in 0..3 {
+                let p00 = rgb[(y0 * src_width + x0) * 3 + c] as f64;
+                let p01 = rgb[(y0 * src_width + x1) * 3 + c] as f64;
+                let p10 = rgb[(y1 * src_width + x0) * 3 + c] as f64;
+                let p11 = rgb[(y1 * src_width + x1) * 3 + c] as f64;
+                let top = p00 * (1.0 - wx) + p01 * wx;
+                let bottom = p10 * (1.0 - wx) + p11 * wx;
+                let value = (top * (1.0 - wy) + bottom * wy).round().clamp(0.0, 255.0) as u8;
+                out.push(value);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Plan the V4.1 image grid for an arbitrary `(width, height)` RGB8 image,
+/// resize it to `(grid.pixel_width, grid.pixel_height)`, and convert to patch-major BF16 values.
+pub fn prepare_image_patches(
+    rgb: &[u8],
+    width: usize,
+    height: usize,
+    config: &VisionConfig,
+) -> Result<(ImageGrid, Vec<f32>), SingularityError> {
+    let grid = plan_image_grid(width, height, config)?;
+    let resized = resize_rgb_bilinear(rgb, width, height, grid.pixel_width, grid.pixel_height)?;
+    let patches = patchify_rgb(&resized, grid, config.patch_size)?;
+    Ok((grid, patches))
 }
 
 /// Match the aligner's padded `unfold`: output rows are grid-major, and each
@@ -614,5 +682,29 @@ mod tests {
         let span = aligner.span(grid, &features).unwrap();
         assert_eq!(&span[..4], &[1.; 4]);
         assert_eq!(&span[span.len() - 4..], &[3.; 4]);
+    }
+
+    #[test]
+    fn resize_and_prepare_image_patches_work() {
+        let mut cfg: crate::v41_config::V41Config = serde_json::from_str(include_str!(
+            "../tests/fixtures/deepseek-v41-flash-1017-config.json"
+        ))
+        .unwrap();
+        cfg.vision_config.patch_size = 2;
+        cfg.vision_config.downsample_ratio = 2;
+        cfg.vision_config.min_pixels = 16;
+        cfg.vision_config.max_image_tokens = 64;
+
+        let src = vec![0u8, 128, 255, 64, 128, 192, 32, 64, 96, 255, 0, 128];
+        assert_eq!(resize_rgb_bilinear(&src, 2, 2, 2, 2).unwrap(), src);
+        assert!(resize_rgb_bilinear(&src, 0, 2, 2, 2).is_err());
+        assert!(resize_rgb_bilinear(&src[..3], 2, 2, 2, 2).is_err());
+
+        let (planned, patches) = prepare_image_patches(&src, 2, 2, &cfg.vision_config).unwrap();
+        assert_eq!((planned.pixel_width, planned.pixel_height), (4, 4));
+        assert_eq!(patches.len(), 4 * 4 * 3);
+        assert!(patches
+            .iter()
+            .all(|v| v.is_finite() && (-1.0..=1.0).contains(v)));
     }
 }

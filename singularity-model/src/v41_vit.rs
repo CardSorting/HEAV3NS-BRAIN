@@ -262,3 +262,79 @@ impl<'a> VisionEncoder<'a> {
         Ok(output)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde::Deserialize;
+    use std::collections::BTreeMap;
+
+    #[derive(Deserialize)]
+    struct TensorData {
+        shape: Vec<usize>,
+        values: Vec<f32>,
+    }
+
+    #[derive(Deserialize)]
+    struct VitVectors {
+        patches: Vec<f32>,
+        output: Vec<f32>,
+        tensors: BTreeMap<String, TensorData>,
+    }
+
+    #[test]
+    fn vision_encoder_matches_checkpoint_reference_vectors() {
+        let vectors: VitVectors =
+            serde_json::from_str(include_str!("../tests/fixtures/v41_vit_vectors.json")).unwrap();
+        let mut header = serde_json::Map::new();
+        let mut payload = Vec::new();
+        for (name, tensor) in &vectors.tensors {
+            let start = payload.len();
+            for &v in &tensor.values {
+                payload.extend_from_slice(&bf16::from_f32(v).to_le_bytes());
+            }
+            header.insert(
+                format!("vision.{name}"),
+                serde_json::json!({
+                    "dtype": "BF16",
+                    "shape": tensor.shape,
+                    "data_offsets": [start, payload.len()]
+                }),
+            );
+        }
+        let header_bytes = serde_json::to_vec(&header).unwrap();
+        let mut file_bytes = (header_bytes.len() as u64).to_le_bytes().to_vec();
+        file_bytes.extend(header_bytes);
+        file_bytes.extend(payload);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        std::fs::write(&path, file_bytes).unwrap();
+        let loader = SafetensorsMmapLoader::open(path).unwrap();
+
+        let config = VisionConfig {
+            num_hidden_layers: 2,
+            hidden_size: 8,
+            num_attention_heads: 2,
+            intermediate_size: 6,
+            patch_size: 2,
+            rope_theta: 10000.0,
+            downsample_ratio: 2,
+            max_image_tokens: 64,
+            min_pixels: 16,
+            max_wh_ratio: Some(4),
+        };
+        let encoder = VisionEncoder::load(&loader, &config).unwrap();
+        let actual = encoder.forward(&vectors.patches, 2, 2).unwrap();
+        assert_eq!(actual.len(), vectors.output.len());
+        for (a, b) in actual.iter().zip(&vectors.output) {
+            assert!((a - b).abs() <= 0.01 * b.abs().max(0.01), "{a} != {b}");
+        }
+
+        // Error and boundary cases
+        assert!(encoder.forward(&vectors.patches, 0, 2).is_err());
+        assert!(encoder.forward(&vectors.patches[..12], 2, 2).is_err());
+        assert!(rotate_2d(&[1.0, 2.0], 0, 0, 10000.0).is_err());
+        assert!(rotate_2d(&[1.0, 2.0, 3.0, 4.0], 0, 0, 1.0).is_err());
+    }
+}

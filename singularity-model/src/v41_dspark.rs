@@ -190,6 +190,8 @@ pub struct VerifiedGreedyOutput {
     pub tokens: Vec<u32>,
     pub proposed: usize,
     pub accepted: usize,
+    pub ttft_ns: u64,
+    pub itl_ns_list: Vec<u64>,
 }
 
 fn greedy_token(logits: &[f32]) -> Result<u32, SingularityError> {
@@ -221,23 +223,34 @@ pub fn generate_verified_greedy(
             "Verification requires fresh models and a nonempty prompt",
         ));
     }
-    let mut current = None;
-    for (i, &token) in prompt.iter().enumerate() {
-        let output = target.forward_token_with_targets(token)?;
-        if i + 1 < prompt.len() {
-            draft.seed(&output.target_hidden)?;
-        }
-        current = Some(output);
+    let t_start = std::time::Instant::now();
+    for &token in &prompt[..prompt.len() - 1] {
+        let target_hidden = target.prefill_token_with_targets(token)?;
+        draft.seed(&target_hidden)?;
     }
-    let mut current = current.unwrap();
+    let mut current = target.forward_token_with_targets(prompt[prompt.len() - 1])?;
     let mut result = VerifiedGreedyOutput {
         tokens: Vec::with_capacity(max_new_tokens),
         proposed: 0,
         accepted: 0,
+        ttft_ns: 0,
+        itl_ns_list: Vec::with_capacity(max_new_tokens.saturating_sub(1)),
+    };
+    let mut last_token_time = t_start;
+    let record_token =
+        |res: &mut VerifiedGreedyOutput, tok: u32, last: &mut std::time::Instant| {
+            let now = std::time::Instant::now();
+        if res.tokens.is_empty() {
+            res.ttft_ns = now.duration_since(t_start).as_nanos() as u64;
+        } else {
+            res.itl_ns_list.push(now.duration_since(*last).as_nanos() as u64);
+        }
+        *last = now;
+        res.tokens.push(tok);
     };
     while result.tokens.len() < max_new_tokens {
         let anchor = greedy_token(&current.logits)?;
-        result.tokens.push(anchor);
+        record_token(&mut result, anchor, &mut last_token_time);
         if anchor == eos || result.tokens.len() == max_new_tokens {
             break;
         }
@@ -262,7 +275,7 @@ pub fn generate_verified_greedy(
                 break;
             }
             result.accepted += 1;
-            result.tokens.push(candidate);
+            record_token(&mut result, candidate, &mut last_token_time);
             if candidate == eos || result.tokens.len() == max_new_tokens {
                 return Ok(result);
             }

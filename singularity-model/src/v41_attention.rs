@@ -6,6 +6,7 @@ use crate::{
     v41_sparse::{sparse_attention_kernel_reference, WindowCache},
 };
 use half::bf16;
+use rayon::prelude::*;
 use singularity_core::SingularityError;
 
 /// Checkpoint-backed dense projections for an uncompressed backbone layer.
@@ -113,9 +114,11 @@ impl<'a> LoadedWindowAttention<'a> {
                 rows,
                 cols,
             } => {
+                use rayon::prelude::*;
                 let blocks = cols.div_ceil(32);
                 (0..rows)
-                    .flat_map(|row| {
+                    .into_par_iter()
+                    .flat_map_iter(|row| {
                         (0..cols).map(move |col| {
                             bf16::from_f32(
                                 e4m3fn(weights[row * cols + col])
@@ -273,20 +276,13 @@ impl<'a> LoadedWindowAttention<'a> {
                 )?);
             }
             let group_dim = self.attention.heads * self.attention.head_dim / self.attention.groups;
-            let mut low_rank =
-                Vec::with_capacity(self.attention.groups * self.attention.output_rank);
-            for (group, values) in rotated.chunks_exact(group_dim).enumerate() {
-                let values = quantize_dequantize(values)?;
-                for row in 0..self.attention.output_rank {
-                    let offset = (group * self.attention.output_rank + row) * group_dim;
-                    let result = self.attention.output_a[offset..offset + group_dim]
-                        .iter()
-                        .zip(&values)
-                        .map(|(w, x)| w * x)
-                        .sum::<f32>();
-                    low_rank.push(bf16::from_f32(result).to_f32());
-                }
-            }
+            let low_rank = project_output_a_groups(
+                &self.attention.output_a,
+                &rotated,
+                self.attention.groups,
+                self.attention.output_rank,
+                group_dim,
+            )?;
             outputs.push(self.output_b.matvec_quantized(&low_rank)?);
         }
         self.attention.cache = next;
@@ -306,11 +302,12 @@ impl<'a> LoadedWindowAttention<'a> {
         if input.len() != self.hidden {
             return Err(error("Invalid attention input shape"));
         }
+        let shared_act = quantize_activation_fp8(input)?;
         self.attention.forward_with_compressed(
             input,
-            |x| self.q_a.matvec_quantized(x),
+            |_| self.q_a.matvec_quantized_with_activation(&shared_act),
             |x| self.q_b.matvec_quantized(x),
-            |x| self.kv.matvec_quantized(x),
+            |_| self.kv.matvec_quantized_with_activation(&shared_act),
             |x| self.output_b.matvec_quantized(x),
             compressed,
         )
@@ -331,6 +328,49 @@ fn quantize_dequantize(input: &[f32]) -> Result<Vec<f32>, SingularityError> {
         .enumerate()
         .map(|(i, &v)| bf16::from_f32(e4m3fn(v) * ue8m0(q.scales[i / 32])).to_f32())
         .collect())
+}
+
+fn project_output_a_groups(
+    output_a: &[f32],
+    rotated: &[f32],
+    groups: usize,
+    output_rank: usize,
+    group_dim: usize,
+) -> Result<Vec<f32>, SingularityError> {
+    let quantized_groups: Vec<Vec<f32>> = rotated
+        .chunks_exact(group_dim)
+        .map(quantize_dequantize)
+        .collect::<Result<Vec<_>, _>>()?;
+    let total_rows = groups * output_rank;
+    if total_rows >= 64 {
+        Ok((0..total_rows)
+            .into_par_iter()
+            .map(|idx| {
+                let group = idx / output_rank;
+                let offset = idx * group_dim;
+                let value = output_a[offset..offset + group_dim]
+                    .iter()
+                    .zip(&quantized_groups[group])
+                    .map(|(w, x)| w * x)
+                    .sum::<f32>();
+                bf16::from_f32(value).to_f32()
+            })
+            .collect())
+    } else {
+        let mut low_rank = Vec::with_capacity(total_rows);
+        for (group, values) in quantized_groups.iter().enumerate() {
+            for row in 0..output_rank {
+                let offset = (group * output_rank + row) * group_dim;
+                let value = output_a[offset..offset + group_dim]
+                    .iter()
+                    .zip(values)
+                    .map(|(w, x)| w * x)
+                    .sum::<f32>();
+                low_rank.push(bf16::from_f32(value).to_f32());
+            }
+        }
+        Ok(low_rank)
+    }
 }
 
 pub struct WindowAttention {
@@ -464,19 +504,13 @@ impl WindowAttention {
             )?);
         }
         let group_dim = total / self.groups;
-        let mut low_rank = Vec::with_capacity(self.groups * self.output_rank);
-        for (group, values) in output.chunks_exact(group_dim).enumerate() {
-            let values = quantize_dequantize(values)?;
-            for row in 0..self.output_rank {
-                let offset = (group * self.output_rank + row) * group_dim;
-                let value = self.output_a[offset..offset + group_dim]
-                    .iter()
-                    .zip(&values)
-                    .map(|(w, x)| w * x)
-                    .sum::<f32>();
-                low_rank.push(bf16::from_f32(value).to_f32());
-            }
-        }
+        let low_rank = project_output_a_groups(
+            &self.output_a,
+            &output,
+            self.groups,
+            self.output_rank,
+            group_dim,
+        )?;
         let result = output_b(&low_rank)?;
         if result.len() != x.len() {
             return Err(error("Invalid output projection shape"));

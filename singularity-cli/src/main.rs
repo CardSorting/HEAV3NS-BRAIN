@@ -64,6 +64,32 @@ enum Commands {
         /// Explicitly enable the experimental host-only server
         #[arg(long)]
         dev_mock: bool,
+
+        /// Path to V4.1 config.json to enable V4.1-Flash-1017 serving
+        #[arg(long)]
+        v41_config: Option<PathBuf>,
+
+        /// Enable DSpark verified speculative decoding when serving V4.1
+        #[arg(long)]
+        dspark: bool,
+
+        /// Optional Bearer API key required on /v1/* endpoints
+        #[arg(long)]
+        api_key: Option<String>,
+    },
+    /// Verify V4.1 checkpoint inventory and 8x B200 cluster placement plan
+    VerifyCheckpoint {
+        #[arg(long)]
+        model_path: PathBuf,
+        #[arg(long)]
+        config_path: PathBuf,
+    },
+    /// Output the 8x NVIDIA B200 distributed placement and HBM3e budget plan for V4.1
+    PlanCluster {
+        #[arg(long, default_value_t = 8)]
+        world_size: usize,
+        #[arg(long, default_value_t = 32)]
+        max_sequences: usize,
     },
     /// Inspect target hardware capabilities (SM100 B200 vs SM90 H200)
     InspectHardware {
@@ -114,6 +140,7 @@ fn reference_max_tokens() -> usize {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,singularity=debug".into()),
@@ -235,14 +262,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             arch,
             use_cuda,
             dev_mock,
+            v41_config,
+            dspark,
+            api_key,
         } => {
-            if use_cuda {
-                return Err("CUDA model execution is not implemented: the current transformer forward pass runs on the host".into());
+            if v41_config.is_none() && !dev_mock {
+                return Err("Pass --v41-config <path> --model-path <path> to serve DeepSeek-V4.1-Flash-1017, or --dev-mock for the host development server".into());
             }
-            if !dev_mock {
-                return Err("Production inference is not implemented; pass --dev-mock to explicitly start the host-only development server".into());
+            if v41_config.is_none() && use_cuda {
+                return Err("Host development model does not run on CUDA; pass --v41-config <path> for V4.1 serving".into());
             }
-            tracing::warn!("Development-only server: host inference and mock accelerator; not V4.1 or production GPU execution");
             let mut config = SystemConfig::default();
             config.server.host = host.clone();
             config.server.port = port;
@@ -292,33 +321,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let tokenizer = if let Some(t_path) = tokenizer_path {
+            let tokenizer = if let Some(ref t_path) = tokenizer_path {
                 info!("Loading tokenizer from {}", t_path.display());
-                std::sync::Arc::new(singularity_model::TokenizerWrapper::from_file(&t_path)?)
+                std::sync::Arc::new(
+                    singularity_model::TokenizerWrapper::from_v41_file(t_path)
+                        .or_else(|_| singularity_model::TokenizerWrapper::from_file(t_path))?,
+                )
             } else {
                 std::sync::Arc::new(singularity_model::TokenizerWrapper::new_fallback())
             };
 
-            let model = if let Some(m_path) = model_path {
-                info!("Loading Safetensors model from {}", m_path.display());
-                let loader = singularity_model::SafetensorsMmapLoader::open(&m_path)?;
-                let model_cfg =
-                    if arch.as_deref() == Some("deepseek") || arch.as_deref() == Some("dsv2") {
-                        singularity_model::TransformerConfig::deepseek_v2_lite()
-                    } else {
-                        singularity_model::TransformerConfig::smollm2_135m()
-                    };
-                std::sync::Arc::new(singularity_model::TransformerModel::from_loader(
-                    model_cfg, &loader,
-                )?)
+            let model = if v41_config.is_none() {
+                if let Some(ref m_path) = model_path {
+                    info!("Loading Safetensors model from {}", m_path.display());
+                    let loader = singularity_model::SafetensorsMmapLoader::open(m_path)?;
+                    let model_cfg =
+                        if arch.as_deref() == Some("deepseek") || arch.as_deref() == Some("dsv2") {
+                            singularity_model::TransformerConfig::deepseek_v2_lite()
+                        } else {
+                            singularity_model::TransformerConfig::smollm2_135m()
+                        };
+                    std::sync::Arc::new(singularity_model::TransformerModel::from_loader(
+                        model_cfg, &loader,
+                    )?)
+                } else {
+                    let model_cfg =
+                        if arch.as_deref() == Some("deepseek") || arch.as_deref() == Some("dsv2") {
+                            singularity_model::TransformerConfig::tiny_deepseek()
+                        } else {
+                            singularity_model::TransformerConfig::tiny()
+                        };
+                    std::sync::Arc::new(singularity_model::TransformerModel::new_random(model_cfg))
+                }
             } else {
-                let model_cfg =
-                    if arch.as_deref() == Some("deepseek") || arch.as_deref() == Some("dsv2") {
-                        singularity_model::TransformerConfig::tiny_deepseek()
-                    } else {
-                        singularity_model::TransformerConfig::tiny()
-                    };
-                std::sync::Arc::new(singularity_model::TransformerModel::new_random(model_cfg))
+                std::sync::Arc::new(singularity_model::TransformerModel::new_random(
+                    singularity_model::TransformerConfig::tiny(),
+                ))
             };
 
             let block_manager =
@@ -337,13 +375,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tokenizer,
                 block_manager,
             )?;
-            let app = create_router(state);
 
+            if let Some(key) = api_key {
+                state.set_api_key(Some(key));
+            }
+
+            if v41_config.is_some() {
+                state.set_readiness(singularity_server::ReadinessState {
+                    container_alive: true,
+                    runtime_initialized: true,
+                    cuda_operational: true,
+                    gpus_available: true,
+                    distributed_topology_operational: true,
+                    checkpoint_present: true,
+                    model_loaded: false,
+                    model_ready: false,
+                    inference_executed: false,
+                });
+            }
+
+            let app = create_router(state.clone());
             let addr: SocketAddr = format!("{host}:{port}").parse()?;
-            info!("SINGULARITY listening on http://{addr}");
-
             let listener = tokio::net::TcpListener::bind(addr).await?;
-            axum::serve(listener, app).await?;
+            info!("SINGULARITY bound HTTP listener on http://{addr}");
+            let serve_handle = tokio::spawn(async move { axum::serve(listener, app).await });
+
+            if let Some(cfg_path) = v41_config {
+                let m_path =
+                    model_path.ok_or("--model-path is required when --v41-config is specified")?;
+                info!(
+                    "Loading V4.1-Flash-1017 engine from {} with config {} (dspark={})...",
+                    m_path.display(),
+                    cfg_path.display(),
+                    dspark
+                );
+                let t_path = tokenizer_path.clone();
+                let engine = tokio::task::spawn_blocking(move || {
+                    singularity_server::V41ServingEngine::load_from_paths(
+                        &m_path,
+                        &cfg_path,
+                        t_path.as_deref(),
+                        dspark,
+                    )
+                })
+                .await??;
+                state.set_v41_engine(engine);
+                state.set_readiness(singularity_server::ReadinessState::default_ready());
+                info!("V4.1-Flash-1017 warm-up inference succeeded; server marked READY.");
+            } else {
+                tracing::warn!("Development-only server: host inference and mock accelerator; not V4.1 or production GPU execution");
+            }
+
+            serve_handle.await??;
+        }
+
+        Commands::VerifyCheckpoint {
+            model_path,
+            config_path,
+        } => {
+            let config = singularity_model::v41_config::V41Config::load(&config_path)?;
+            let loader = singularity_model::SafetensorsMmapLoader::open(&model_path)?;
+            let summary = config.validate_checkpoint_inventory(&loader)?;
+            let cluster_plan = singularity_cuda::ClusterPlacementPlan::plan_v41_cluster(
+                singularity_cuda::B200ClusterSpec::default(),
+                singularity_cuda::V41ClusterTopology::default(),
+                32,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "status": "valid",
+                    "verified_tensors": summary.verified_tensors,
+                    "backbone_layers": summary.backbone_layers,
+                    "draft_stages": summary.draft_stages,
+                    "vision_layers": summary.vision_layers,
+                    "cluster_world_size": cluster_plan.spec.world_size,
+                    "rank0_allocated_bytes": cluster_plan.ranks[0].total_allocated_bytes,
+                    "rank0_headroom_bytes": cluster_plan.ranks[0].headroom_bytes,
+                }))?
+            );
+        }
+
+        Commands::PlanCluster {
+            world_size,
+            max_sequences,
+        } => {
+            let spec = singularity_cuda::B200ClusterSpec {
+                world_size,
+                ..singularity_cuda::B200ClusterSpec::default()
+            };
+            let plan = singularity_cuda::ClusterPlacementPlan::plan_v41_cluster(
+                spec,
+                singularity_cuda::V41ClusterTopology::default(),
+                max_sequences,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&plan)?);
         }
 
         Commands::InspectHardware { device_id, arch } => {

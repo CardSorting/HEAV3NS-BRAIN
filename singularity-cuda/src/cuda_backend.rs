@@ -99,16 +99,21 @@ impl CudaBackend {
         {
             let _init = self.v41_kernel_init.lock();
             if !self.device.has_func("v41_quant", "v41_matvec") {
-                let opts = cudarc::nvrtc::CompileOptions {
-                    arch: Some("compute_90"),
-                    fmad: Some(false),
-                    ..Default::default()
+                let preferred_arch = match self.arch {
+                    DeviceArchitecture::BlackwellSm100 { .. } => "compute_100",
+                    _ => "compute_90",
                 };
-                let ptx = cudarc::nvrtc::compile_ptx_with_opts(
-                    include_str!("kernels/v41_quant.cu"),
-                    opts,
-                )
-                .map_err(|e| fail(format!("NVRTC V4.1 compilation failed: {e:?}")))?;
+                let compile = |arch: &'static str| {
+                    let opts = cudarc::nvrtc::CompileOptions {
+                        arch: Some(arch),
+                        fmad: Some(false),
+                        ..Default::default()
+                    };
+                    cudarc::nvrtc::compile_ptx_with_opts(include_str!("kernels/v41_quant.cu"), opts)
+                };
+                let ptx = compile(preferred_arch)
+                    .or_else(|_| compile("compute_90"))
+                    .map_err(|e| fail(format!("NVRTC V4.1 compilation failed: {e:?}")))?;
                 self.device
                     .load_ptx(ptx, "v41_quant", &["v41_quantize", "v41_matvec"])
                     .map_err(|e| fail(format!("CUDA V4.1 module loading failed: {e:?}")))?;

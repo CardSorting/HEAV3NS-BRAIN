@@ -48,5 +48,6 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 criterion = { version = "0.5", features = ["async_tokio"] }
 libc = "0.2"
 half = { version = "2.4", features = ["serde"] }
+rayon = "1.10"
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 cudarc = { version = "0.12", default-features = false, features = ["driver", "cublas", "cuda-12050"] }

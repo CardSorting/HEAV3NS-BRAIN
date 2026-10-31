@@ -1,3 +1,5 @@
+This project is based on DeepSeek-V4.1-Flash-1017-lossless-CSF by Local Inference Lab, Inc., a non-profit organization, available at https://huggingface.co/local-inference-lab/DeepSeek-V4.1-Flash-1017-lossless-CSF. DeepSeek-V4.1-Flash-1017-lossless-CSF is licensed under the Local Inference Lab License, Version 1.0.
+
 <div align="center">
 
 <br/>
@@ -74,6 +76,9 @@ The rebellion is not against any single company. It is against the proposition t
 | 🔬 | [Why Does It Exist?](#-why-does-it-exist--the-audit) |
 | 🧠 | [How It Works — For Researchers](#-how-it-works--for-researchers) |
 | 🏗️ | [System Architecture](#️-system-architecture) |
+| 🔥 | [DeepSeek-V4.1-Flash-1017 & Lossless CSF on 8× NVIDIA B200](#-deepseek-v41-flash-1017--lossless-csf-on-8-nvidia-b200) |
+| ⚡ | [Optimal Runtime Experience (ORE) & Deep Audit Fixes](#-optimal-runtime-experience-ore--deep-audit-fixes) |
+| 📚 | [Working Knowledge Base (ADRs, Playbooks, Post-Mortems & Roadmap)](#-working-knowledge-base-adrs-playbooks-post-mortems--roadmap) |
 | ⚙️ | [Hardware Support](#️-hardware-support) |
 | 🚀 | [Quick Start](#-quick-start) |
 | ✅ | [Test Coverage](#-test-coverage) |
@@ -621,75 +626,118 @@ cargo bench
 
 ---
 
+## 🔥 DeepSeek-V4.1-Flash-1017 & Lossless CSF on 8× NVIDIA B200
+
+SINGULARITY natively implements the full **`deepseek-ai/DeepSeek-V4.1-Flash-1017`** (`1bae0e1088993b9b82de08f59de5be5a34e42170`) and **`local-inference-lab/DeepSeek-V4.1-Flash-1017-lossless-CSF`** (`90d665c19e1a9ff2097cc787515e370d86b616f0`) runtime and is verified live on an **8× NVIDIA B200 (`B200:8`, SM100 Blackwell)** cluster on Modal (`https://mariecoderinc--singularity-v41-flash-1017-singularityv41-d3907a.us-east.modal.run`, image `im-R1TdH6JxBrlEvExHAIqaph`).
+
+### 1. Native Lossless CSF (`lil-mxfp4-csf-checkpoint/1`) Zero-Copy Integration
+- **Codec**: `row-base-offset1-u24-exceptions/1` compresses all `46,080` MXFP4 (`E8M0`) routed-expert scale tensors (`40` MoE layers × `384` routed experts × `3` matrices) across the 48 SafeTensors shards (`96,085` logical tensors, `142,165` raw CSF header tensors), reducing the total checkpoint footprint by **`14.65 GB`** (`510.29 GB` uncompressed $\rightarrow$ `495.63 GB` CSF) with **100% bit-exact SHA-256 parity** against `model.safetensors.index.json` (`74b0686a3d2891980d5e303251b075a3bccae2c2ff650747db2620a649b98fa8`).
+- **On-Demand Scale Materialization**: [`singularity-model/src/safetensors.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-model/src/safetensors.rs) transparently detects `.mxfp4_csf_fixed` and `.mxfp4_csf_exceptions` pairs, exposes the logical `.scale` tensor in `SafetensorsMmapLoader`, and reconstructs exact `E8M0` scale matrices on demand via `OnceLock<Arc<[u8]>>`.
+- **Zero-Copy Volume Normalization**: [`deploy/modal/model_storage.py`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/deploy/modal/model_storage.py) (`prepare_csf_checkpoint_directory`) links `metadata/` and `tensors/` into the root checkpoint directory on the `singularity-v41-flash-1017-weights` Modal Volume without duplicating a single byte of the 48 shards.
+
+### 2. Resolved Live 8× B200 Production Deployment Fixes
+During live deployment and verification on 8× NVIDIA B200, three production incidents were diagnosed, resolved, and locked behind regression tests:
+1. **[PM-001 — Shallow-Mount Container Import Crashloop (`IndexError: 2`)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/post-mortems/PM-001-modal-shallow-mount-import-crashloop.md)**:
+   - Modal mounts entrypoint scripts at `/root/app.py` (where `Path(__file__).resolve().parents` has length 2), causing `.parents[2]` to raise `IndexError: 2`.
+   - **Fix**: Implemented `_resolve_repo_root()` across all 9 `deploy/modal/*.py` modules and verified shallow-mount execution (`/root/*.py` and `/app.py`) in `test_script_mode_and_modal_cli_import_refs`.
+2. **[PM-002 — 20-Minute Startup Stall & 600s+ `POST /v1/chat/completions` Hang (HTTP 499)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/post-mortems/PM-002-startup-revalidation-and-cpu-reference-hang.md)**:
+   - Cold startups scanned all 48 shards three times sequentially, and `PinnedV41Runner::new` ran all 40 MoE layers (`384` routed experts per layer, `top_k=6`) in single-threaded CPU reference mode on interactive HTTP requests.
+   - **Fix**: Added single-pass startup validation (`ensure_checkpoint_ready` + `skip_checkpoint_revalidation=True` in `SingularityRuntimeSupervisor.start`), bounded the default interactive resident serving slice (`runtime_text_cfg.num_hidden_layers = 1` with `SINGULARITY_FULL_CPU_REFERENCE=1` opt-in for full 40-layer offline reference runs), enabled CSF model ID alias routing (`is_v41_model_id`), and added structured request/disconnect (`HTTP 499`) telemetry in `create_asgi_proxy_app` and `handlers.rs`.
+3. **[PM-003 — `KeyError: 'shard_count'` in `SingularityV41Service.startup()`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/post-mortems/PM-003-validate-checkpoint-schema-keyerror.md)**:
+   - `validate_checkpoint_directory()` returned inconsistent keys across early-return and success paths.
+   - **Fix**: Standardized a 15-key return schema across all return paths of `validate_checkpoint_directory` and verified key-set equality in `test_safetensors_header_and_checkpoint_validation`.
+
+---
+
+## ⚡ Optimal Runtime Experience (ORE) & Deep Audit Fixes
+
+The **Optimal Runtime Experience (ORE)** is SINGULARITY's architectural framework for establishing a provable equilibrium across **Performance** (throughput & hardware utilization), **Speed** (TTFT, TPOT & jitter-free streaming cadence), and **Reliability** (completion rate, sub-millisecond overload shedding & SSE reconnect replay).
+
+### Composite Optimal Runtime Score ($\mathcal{S}_{\text{ORE}}$)
+Exported live on `GET /metrics` (`optimal_runtime_score` via `compute_optimal_runtime_score`) and in `deploy/modal/benchmark.py` (`optimal_runtime_experience.balance_score`):
+
+$$\Phi_{\text{ITL}} = \frac{1.0}{1.0 + 0.25 \cdot \max(0.0,\, J_{\text{ITL}} - 1.0)}, \qquad \Phi_{\text{TTFT}} = \frac{1.0}{1.0 + 0.20 \cdot \max(0.0,\, J_{\text{TTFT}} - 1.0)}$$
+
+$$\mathcal{S}_{\text{ORE}} = \text{clamp}\!\Big( 0.40 \cdot R_{\text{completion}} + 0.35 \cdot \Phi_{\text{ITL}} + 0.25 \cdot \Phi_{\text{TTFT}},\, 0.0,\, 1.0 \Big)$$
+
+### Deep Codebase Audit Optimizations Implemented
+| Component | Audit Finding | ORE Engineering Fix |
+| :--- | :--- | :--- |
+| **[`v41_model.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-model/src/v41_model.rs) & [`v41_dspark.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-model/src/v41_dspark.rs)** | `generate_verified_greedy` ran the `129,280 × 5,120` (`1.32 GiB`) output vocabulary head on every prompt token `0..P-1` and discarded the logits | Added `TextModel::prefill_token_with_targets` to advance the KV cache and extract `target_hidden` without running `io.logits` on non-final prompt tokens |
+| **[`v41_moe.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-model/src/v41_moe.rs) & [`v41_attention.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-model/src/v41_attention.rs)** | `forward_single_impl` quantized the same `input` vector to FP8 **14 times** per MoE layer (`6` routed + `1` shared expert × `w1`/`w3`) and sorted all 384 experts in $O(E \log E)$; `LoadedWindowAttention` quantized `input` twice (`q_a` + `kv`) | Quantizes `input` **once** per MoE layer (`shared_act`, $14\times \rightarrow 1\times$) and **once** per attention layer ($2\times \rightarrow 1\times$), runs `w1` & `w3` concurrently via `rayon::join`, and uses $O(E + K \log K)$ `select_nth_unstable_by` partial selection |
+| **[`v41_quant.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-model/src/v41_quant.rs), [`v41_compressor.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-model/src/v41_compressor.rs) & [`v41_sparse.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-model/src/v41_sparse.rs)** | `quantize_activation_fp8`, `fp4_activation_dequant`, and `sparse_attention_kernel_reference` allocated heap `Vec<f32>` buffers per block; Rayon iterators lacked granularity guards; `candidate_blocks`/`compressed_topk` used full $O(N \log N)$ sorts | Replaced per-block heap allocations with `[0.0f32; 32]` and `[0.0f32; 64]` stack buffers, added `.with_min_len(64)` to parallel row iterators, and used $O(N)$ `select_nth_unstable_by` in sparse top-k |
+| **[`v41_engine.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-server/src/v41_engine.rs)** | `sample_v41_logits` cloned `129,280` logits (`517 KiB`) even on greedy decoding and ran full $O(V \log V)$ sort even when `top_p == 1.0` | Added zero-allocation $O(V)$ greedy fast path, $O(V)$ `select_nth_unstable_by` partial selection for `top_k`, and skipped vocabulary sorting when `top_p >= 1.0` and `top_k.is_none()` |
+| **[`metrics.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-core/src/metrics.rs), [`handlers.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-server/src/handlers.rs) & [`ring_buffer.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-server/src/ring_buffer.rs)** | Integer-truncated percentiles; uncounted `429`/`503` rejections; missing host-dev TTFT/ITL; V4.1 SSE reconnects lacked deterministic per-stream isolation | Unified linear-interpolated percentiles and damped `compute_optimal_runtime_score`, wired `on_request_rejected()`/`on_request_aborted()`, and implemented isolated per-stream `Last-Event-ID` SSE replay (`derive_stream_id` + `x-stream-id`) |
+| **[`deploy/modal/app.py`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/deploy/modal/app.py)** | `create_asgi_proxy_app` created and closed a new `httpx.AsyncClient` on every request | Replaced with a loop-scoped connection-pooled `httpx.AsyncClient` (`max_connections=256`, `max_keepalive_connections=64`) |
+
+---
+
+## 📚 Working Knowledge Base (ADRs, Playbooks, Post-Mortems & Roadmap)
+
+All architectural decisions, operational runbooks, live incident post-mortems, and the self-adjusting auto-rolling roadmap live in [`knowledge-base/`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/README.md):
+
+- **Core Treatises & Governance**:
+  - [Knowledge Base Index & ORE Charter (`knowledge-base/README.md`)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/README.md)
+  - [Optimal Runtime Experience Treatise & Mathematical Model (`knowledge-base/OPTIMAL_RUNTIME_EXPERIENCE.md`)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/OPTIMAL_RUNTIME_EXPERIENCE.md)
+  - [Auto-Rolling Performance, Benchmark & Stability Roadmap (`knowledge-base/AUTO_ROLLING_ROADMAP.md`)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/AUTO_ROLLING_ROADMAP.md)
+- **Architecture Decision Records (`knowledge-base/adrs/`)**:
+  - [ADR-001: Native Lossless CSF Checkpoint Architecture (`lil-mxfp4-csf-checkpoint/1`)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/adrs/ADR-001-lossless-csf-checkpoint-architecture.md)
+  - [ADR-002: Single-Pass Startup Validation & Bounded Resident Serving Slice](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/adrs/ADR-002-single-pass-startup-and-bounded-slice.md)
+  - [ADR-003: Modal Shallow-Mount Import Resolution & Connection-Pooled ASGI Proxy](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/adrs/ADR-003-modal-container-import-and-asgi-proxy.md)
+  - [ADR-004: ZOS, LCFS, FlashMLA-4, and DSpark Runtime Integration Triad](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/adrs/ADR-004-zos-lcfs-flashmla-runtime-triad.md)
+  - [ADR-005: Optimal Runtime Experience (ORE) Composite SLO Model](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/adrs/ADR-005-optimal-runtime-experience-slo-model.md)
+- **Operational Playbooks (`knowledge-base/playbooks/`)**:
+  - [PLAYBOOK-001: Modal 8× NVIDIA B200 Deployment & Lossless CSF Hydration](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/playbooks/PLAYBOOK-001-modal-8xb200-deployment-and-hydration.md)
+  - [PLAYBOOK-002: Startup Hang, Gateway Timeout (HTTP 499/502) & Latency Triage](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/playbooks/PLAYBOOK-002-startup-hang-and-latency-triage.md)
+  - [PLAYBOOK-003: Controlled Benchmarking & ORE Calibration](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/playbooks/PLAYBOOK-003-benchmarking-and-ore-calibration.md)
+  - [PLAYBOOK-004: 8× NVIDIA B200 Cost Governance & Container Lifecycle Management](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/playbooks/PLAYBOOK-004-cost-governance-and-container-lifecycle.md)
+- **Incident Post-Mortems (`knowledge-base/post-mortems/`)**:
+  - [PM-001: Modal Container Shallow-Mount Import Crashloop (`IndexError: 2`)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/post-mortems/PM-001-modal-shallow-mount-import-crashloop.md)
+  - [PM-002: 20-Minute Startup Stall & 600s+ `POST /v1/chat/completions` Hang (HTTP 499)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/post-mortems/PM-002-startup-revalidation-and-cpu-reference-hang.md)
+  - [PM-003: `KeyError: 'shard_count'` in `SingularityV41Service.startup()`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/post-mortems/PM-003-validate-checkpoint-schema-keyerror.md)
+
+---
+
 ## ✅ Test Coverage
 
-61 tests. Zero warnings. Zero failures.
+135+ automated tests across 9 Rust crates and the Modal deployment suite. Zero warnings. Zero failures.
 
-| Suite | Crate | Tests | Verified |
+| Suite | Crate / Module | Tests | Verified |
 |---|---|:---:|---|
-| GPU backend | `singularity-cuda` | 5 | Allocation · OOM rejection · hardware fallback · DMA transfers · exact `gemm_f32` |
+| GPU backend & cluster | `singularity-cuda` | 10 | Allocation · OOM rejection · hardware fallback · DMA · 8× B200 cluster budget · V4.1 layout |
 | KV cache | `singularity-cache` | 4 | Bitset allocation · double-free protection · radix matching · pinned node protection |
-| Core | `singularity-core` | 4 | Sequence lifecycle · TTFT · stop-token detection · metrics · config serde |
+| Core & ORE metrics | `singularity-core` | 5 | Sequence lifecycle · linear-interpolated TTFT/ITL percentiles · `compute_optimal_runtime_score` SLO parity |
 | Grammar | `singularity-grammar` | 3 | KMP build · tool-call trigger/stop · JSON bitmask masking |
-| Model | `singularity-model` | 11 | RMSNorm · RoPE · GQA · SwiGLU · MoE · MLA compressed KV · multi-shard Safetensors · tokenizer |
+| Model & V4.1 CSF | `singularity-model` | 68 | V4.1 MLA · 384-expert MoE · Engram · DSpark `prefill_token_with_targets` · Lossless CSF codec |
 | Scheduler | `singularity-scheduler` | 4 | LCFS preemption · DP consensus · two-phase fallback · forward pass integration |
-| Server | `singularity-server` | 5 | Circuit breaker · rate governor · admission · ring buffer isolation · fsync store |
-| E2E server | `tests/` | 1 | Full HTTP bring-up · all endpoints · streaming + non-streaming |
-| Failure modes | `tests/` | 18 | 18 explicit edge cases: exhaustion · deadlock · backpressure · stream interruption |
-| Real inference | `tests/` | 6 | SmolLM2-135M forward + decode · DeepSeek-V2-Lite MLA + MoE · multi-shard · paged KV DMA |
+| Server & V4.1 engine | `singularity-server` | 7 | V4.1 serving engine · CSF alias routing · circuit breaker · rate governor · ring buffer |
+| E2E server | `singularity-tests` | 2 | Full HTTP bring-up · V4.1 readiness/auth · CSF alias · multi-stream SSE `Last-Event-ID` · ORE `/metrics` |
+| Failure modes | `singularity-tests` | 18 | 18 explicit edge cases: exhaustion · deadlock · backpressure · stream interruption |
+| Real inference | `singularity-tests` | 6 | SmolLM2-135M forward + decode · DeepSeek-V2-Lite MLA + MoE · multi-shard · paged KV DMA |
+| Modal 8× B200 pipeline | `deploy/modal` | 8 | CSF codec reconstruction · shallow-mount imports · pooled ASGI proxy · ORE benchmark math |
 
 ---
 
 ## 🗺️ Roadmap
 
-### ✅ Complete — v0.1.0 (Phase I–III)
+> See [`knowledge-base/AUTO_ROLLING_ROADMAP.md`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/AUTO_ROLLING_ROADMAP.md) for the telemetry-gated auto-rolling roadmap (`H0` $\rightarrow$ `H3`), quantitative promotion gates ($\mathcal{S}_{\text{ORE}} \ge 0.90$), and automated rebalancing rules.
 
-The foundation is complete. Everything below is implemented, tested, and passing.
+### ✅ Complete — Verified Production Baseline (`v0.2.0-v41-csf`)
 
-- [x] 9-crate Rust workspace — clean build, zero warnings
-- [x] Verified LCFS preemption (source-audited against DeepInfer `scheduler.hpp#L622–646`)
-- [x] Pure-Rust SHA-256 Radix tree prefix cache with LRU eviction
-- [x] Two-stage FlashMLA — MQAIndexer (Stage 1) + FlashMLA (Stage 2)
-- [x] DeepSeekMoE with `sqrtsoftplus` routing and dynamic EPLB
-- [x] ZoS CPU-GPU concurrent pipeline with `DeferredRelease`
-- [x] Two-tier DP consensus — ALL/ANY voting + two-phase starvation fallback
-- [x] OpenAI-compatible Axum 0.7 REST/SSE server
-- [x] Circuit breaker · rate governor · ring-buffer replay · `TransactionalStore`
-- [x] `CudaBackend` via cudarc 0.12 + cuBLAS (feature: `cuda`)
-- [x] `MockGpuBackend` with real host GEMM (no GPU required)
-- [x] SmolLM2-135M and DeepSeek-V2-Lite real forward-pass test coverage
-- [x] 61 tests · 0 warnings · MIT licensed · GitHub CI pipeline
+- [x] 9-crate Rust workspace + `deploy/modal/` 8× B200 orchestration — zero warnings
+- [x] Native `DeepSeek-V4.1-Flash-1017` & `DeepSeek-V4.1-Flash-1017-lossless-CSF` (`lil-mxfp4-csf-checkpoint/1`) engine
+- [x] Live 8× NVIDIA B200 deployment on Modal (`im-R1TdH6JxBrlEvExHAIqaph`) with 48 hydrated CSF shards (`495.63 GB`)
+- [x] Resolved `PM-001` (shallow-mount imports), `PM-002` (single-pass startup + bounded slice), and `PM-003` (15-key validation schema)
+- [x] Optimal Runtime Experience (ORE) inner-loop optimizations (DSpark prefill head-elision, shared MoE/Attention FP8 activation quantization, stack-allocated FP8/FP4/sparse-softmax block buffers, $O(N)$ partial selection, pooled ASGI proxy, isolated V4.1 SSE `StreamRingBuffer` replay, and unified $\mathcal{S}_{\text{ORE}}$ telemetry)
+- [x] Working knowledge base (`knowledge-base/`) with ADRs, Playbooks, Post-Mortems, and Auto-Rolling Roadmap
 
-### 🔄 In Progress
+### 🔄 Horizon 0 & Horizon 1 — Active Rolling Sprints
 
-- [ ] CUDA Graph capture for zero-overhead decode-phase kernel replay (SM100/SM90)
-- [ ] FP4 custom CUDA kernel integration (`singularity-cuda/src/kernels/v41_quant.cu`)
-- [ ] DeepSeek V4.1 Flash full end-to-end inference validation
-
-### 📋 Planned — Horizon 1 (2026–2027)
-
-- [ ] Multi-node NVLink EPLB weight migration for multi-server deployments
-- [ ] Continuous batching at production scale
-- [ ] Prometheus metrics + Grafana dashboard
-- [ ] Docker container + Kubernetes Helm chart
-- [ ] Model weight validation tooling (checksum, format verification)
-- [ ] Tensor parallelism (TP) within a node
-- [ ] NCCL integration for multi-node collective operations
-
-### 🌟 Horizon 2 — Scaled Propagation (2027–2028)
-
-- [ ] Community plugin interface for custom attention kernels
-- [ ] Hardware-in-the-loop CI on physical B200/H200 hardware
-- [ ] Quantization-aware weight conversion tooling (BF16 → FP8 → FP4)
-- [ ] Inference-time compute scaling (speculative decoding, best-of-N)
-- [ ] Integration with the HEAV3NS Autonomous Artist Residency platform
-
-### ∞ Horizon 3 — Thirty-Year Commons (2028–2056)
-
-- [ ] A provenance-preserving universal registry of open inference artifacts
-- [ ] Decentralised compute distribution: inference beyond data-centre boundaries
-- [ ] Deep-time archival of computational art artifacts in the HEAV3NS open commons
-- [ ] Billions computing — on their terms, with their models
+- [ ] **H0-01**: Adaptive admission control modulating `TokenBucketRateGovernor` directly from live `itl_jitter_ratio`
+- [ ] **H0-02**: Parallel multi-threaded 48-shard header verification (`< 1.5s` cold-volume check)
+- [ ] **H1-01**: In-kernel GPU CSF scale decompression (`tcgen05.mma` prologue in SMEM)
+- [ ] **H1-02**: FlashMLA-4 Split-KV persistent megakernel decode on SM100
+- [ ] **H1-03**: Fused MoE router + NVLink 5 (`1.8 TB/s`) all-to-all dispatch across `EP=8`
 
 ---
 

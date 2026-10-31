@@ -188,6 +188,7 @@ impl ZosScheduler {
         if let Some(tx) = self.listeners.lock().remove(&seq_id) {
             let _ = tx.send(SequenceOutputEvent::Cancelled);
         }
+        self.kv_caches.lock().remove(&seq_id);
 
         // Check waiting queue
         {

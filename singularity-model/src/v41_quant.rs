@@ -11,8 +11,7 @@ fn error(reason: &str) -> SingularityError {
     }
 }
 
-/// Decode an E4M3FN byte, including subnormals, signed zero and NaN.
-pub fn e4m3fn(byte: u8) -> f32 {
+const fn compute_e4m3fn(byte: u8) -> f32 {
     let sign = if byte & 0x80 == 0 { 1.0 } else { -1.0 };
     let exponent = (byte >> 3) & 15;
     let mantissa = byte & 7;
@@ -20,15 +19,29 @@ pub fn e4m3fn(byte: u8) -> f32 {
         return f32::NAN;
     }
     let magnitude = if exponent == 0 {
-        mantissa as f32 * (1.0 / 512.0)
+        (mantissa as f32) * (1.0 / 512.0)
     } else {
-        (1.0 + mantissa as f32 / 8.0) * 2.0f32.powi(exponent as i32 - 7)
+        let exp_scale = f32::from_bits(((exponent as u32) + 120) << 23);
+        (1.0 + (mantissa as f32) * (1.0 / 8.0)) * exp_scale
     };
     sign * magnitude
 }
 
-/// Decode UE8M0. 255 is the format's NaN encoding; zero denotes 2^-127.
-pub fn ue8m0(byte: u8) -> f32 {
+const E4M3FN_LUT: [f32; 256] = {
+    let mut table = [0.0f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = compute_e4m3fn(i as u8);
+        i += 1;
+    }
+    table
+};
+
+const E2M1FN_LUT: [f32; 16] = [
+    0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+];
+
+const fn compute_ue8m0(byte: u8) -> f32 {
     match byte {
         0 => f32::from_bits(0x0040_0000),
         255 => f32::NAN,
@@ -36,15 +49,32 @@ pub fn ue8m0(byte: u8) -> f32 {
     }
 }
 
-/// E2M1FN nibble, as stored in the expert checkpoint.
-pub fn e2m1fn(nibble: u8) -> f32 {
-    const VALUES: [f32; 8] = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
-    let value = VALUES[(nibble & 7) as usize];
-    if nibble & 8 == 0 {
-        value
-    } else {
-        -value
+const UE8M0_LUT: [f32; 256] = {
+    let mut table = [0.0f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = compute_ue8m0(i as u8);
+        i += 1;
     }
+    table
+};
+
+/// Decode an E4M3FN byte, including subnormals, signed zero and NaN.
+#[inline(always)]
+pub fn e4m3fn(byte: u8) -> f32 {
+    E4M3FN_LUT[byte as usize]
+}
+
+/// Decode UE8M0. 255 is the format's NaN encoding; zero denotes 2^-127.
+#[inline(always)]
+pub fn ue8m0(byte: u8) -> f32 {
+    UE8M0_LUT[byte as usize]
+}
+
+/// E2M1FN nibble, as stored in the expert checkpoint.
+#[inline(always)]
+pub fn e2m1fn(nibble: u8) -> f32 {
+    E2M1FN_LUT[(nibble & 15) as usize]
 }
 
 /// In-place FP4 activation quantization as used by compressed KV and indexer
@@ -60,9 +90,14 @@ pub fn fp4_activation_dequant(
     }
     let mut output = Vec::with_capacity(input.len());
     for group in input.chunks_exact(block) {
-        let values: Vec<f32> = group.iter().map(|&v| bf16::from_f32(v).to_f32()).collect();
-        if values.iter().any(|v| !v.is_finite()) {
-            return Err(error("Non-finite FP4 activation"));
+        let mut stack_buf = [0.0f32; 32];
+        let values = &mut stack_buf[..block];
+        for (dst, &v) in values.iter_mut().zip(group.iter()) {
+            let rounded = bf16::from_f32(v).to_f32();
+            if !rounded.is_finite() {
+                return Err(error("Non-finite FP4 activation"));
+            }
+            *dst = rounded;
         }
         let amax = values.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
         let scale = if e4m3_scale {
@@ -76,7 +111,7 @@ pub fn fp4_activation_dequant(
             }
             ue8m0(exp as u8)
         };
-        for value in values {
+        for &value in values.iter() {
             let normalized = (value.abs() / scale).min(6.0);
             let mut best = 0u8;
             let mut distance = f32::INFINITY;
@@ -144,9 +179,13 @@ pub fn quantize_activation_fp8(input: &[f32]) -> Result<QuantizedActivation, Sin
     let mut values = Vec::with_capacity(input.len());
     let mut scales = Vec::with_capacity(input.len() / 32);
     for group in input.chunks_exact(32) {
-        let rounded: Vec<f32> = group.iter().map(|&x| bf16::from_f32(x).to_f32()).collect();
-        if rounded.iter().any(|x| !x.is_finite()) {
-            return Err(error("Non-finite BF16 activation"));
+        let mut rounded = [0.0f32; 32];
+        for (dst, &x) in rounded.iter_mut().zip(group.iter()) {
+            let r = bf16::from_f32(x).to_f32();
+            if !r.is_finite() {
+                return Err(error("Non-finite BF16 activation"));
+            }
+            *dst = r;
         }
         let amax = rounded.iter().map(|x| x.abs()).fold(1e-4f32, f32::max);
         let bits = (amax * (1.0 / 448.0)).to_bits();
@@ -190,12 +229,21 @@ pub enum CheckpointMatrix<'a> {
         rows: usize,
         cols: usize,
     },
+    LazyExpert {
+        loader: &'a crate::SafetensorsMmapLoader,
+        weights: &'a [u8],
+        scale_name: String,
+        rows: usize,
+        cols: usize,
+    },
 }
 
 impl<'a> CheckpointMatrix<'a> {
     pub fn shape(&self) -> (usize, usize) {
         match self {
-            Self::Dense { rows, cols, .. } | Self::Expert { rows, cols, .. } => (*rows, *cols),
+            Self::Dense { rows, cols, .. }
+            | Self::Expert { rows, cols, .. }
+            | Self::LazyExpert { rows, cols, .. } => (*rows, *cols),
         }
     }
     pub fn load(
@@ -235,14 +283,26 @@ impl<'a> CheckpointMatrix<'a> {
             return Err(error("Quantized checkpoint scale shape mismatch"));
         }
         let weights = loader.get_tensor_bytes(weight_name)?;
-        let scales = loader.get_tensor_bytes(scale_name)?;
         let expected_weights = rows
             .checked_mul(stored_cols)
             .ok_or_else(|| error("Quantized weight size overflow"))?;
         let expected_scales = s.shape[0]
             .checked_mul(s.shape[1])
             .ok_or_else(|| error("Quantized scale size overflow"))?;
-        if weights.len() != expected_weights || scales.len() != expected_scales {
+        if weights.len() != expected_weights {
+            return Err(error("Quantized tensor payload length mismatch"));
+        }
+        if is_expert && loader.is_csf_scale(scale_name) {
+            return Ok(Self::LazyExpert {
+                loader,
+                weights,
+                scale_name: scale_name.to_string(),
+                rows,
+                cols,
+            });
+        }
+        let scales = loader.get_tensor_bytes(scale_name)?;
+        if scales.len() != expected_scales {
             return Err(error("Quantized tensor payload length mismatch"));
         }
         Ok(if is_expert {
@@ -276,6 +336,16 @@ impl<'a> CheckpointMatrix<'a> {
                 rows,
                 cols,
             } => expert_fp4_matvec(weights, scales, *rows, *cols, x),
+            Self::LazyExpert {
+                loader,
+                weights,
+                scale_name,
+                rows,
+                cols,
+            } => {
+                let scales = loader.get_tensor_bytes(scale_name)?;
+                expert_fp4_matvec(weights, scales, *rows, *cols, x)
+            }
         }
     }
 
@@ -287,6 +357,24 @@ impl<'a> CheckpointMatrix<'a> {
             return Err(error("Invalid quantized GEMM dimensions"));
         }
         let activation = quantize_activation_fp8(x)?;
+        self.matvec_quantized_with_activation(&activation)
+    }
+
+    /// Execute block GEMM using a pre-quantized FP8 activation vector (avoiding
+    /// redundant re-quantization across `w1`, `w3`, and multiple routed experts).
+    pub fn matvec_quantized_with_activation(
+        &self,
+        activation: &QuantizedActivation,
+    ) -> Result<Vec<f32>, SingularityError> {
+        let (rows, cols) = self.shape();
+        if cols == 0
+            || cols % 32 != 0
+            || rows == 0
+            || activation.values.len() != cols
+            || activation.scales.len() != cols / 32
+        {
+            return Err(error("Invalid quantized GEMM dimensions"));
+        }
         let blocks = cols / 32;
         let (weights, scales, expert) = match self {
             Self::Dense {
@@ -295,6 +383,12 @@ impl<'a> CheckpointMatrix<'a> {
             Self::Expert {
                 weights, scales, ..
             } => (*weights, *scales, true),
+            Self::LazyExpert {
+                loader,
+                weights,
+                scale_name,
+                ..
+            } => (*weights, loader.get_tensor_bytes(scale_name)?, true),
         };
         let weight_count = rows
             .checked_mul(if expert { cols / 2 } else { cols })
@@ -305,26 +399,49 @@ impl<'a> CheckpointMatrix<'a> {
         if weights.len() != weight_count || scales.len() != scale_count {
             return Err(error("Invalid quantized GEMM buffers"));
         }
-        let mut output = vec![0.0; rows];
-        for (row, result) in output.iter_mut().enumerate() {
-            for block in 0..blocks {
-                let mut acc = 0.0;
-                for k in block * 32..(block + 1) * 32 {
-                    let value = if expert {
-                        let b = weights[row * (cols / 2) + k / 2];
-                        e2m1fn(if k % 2 == 0 { b & 15 } else { b >> 4 })
-                    } else {
-                        e4m3fn(weights[row * cols + k])
-                    };
-                    acc += e4m3fn(activation.values[k]) * value;
+        let act_values: Vec<f32> = activation.values.iter().map(|&b| e4m3fn(b)).collect();
+        let act_scales: Vec<f32> = activation.scales.iter().map(|&b| ue8m0(b)).collect();
+        let compute_row = |row: usize| -> f32 {
+            let mut result = 0.0f32;
+            let scale_row = if expert { row } else { row / 32 };
+            let scale_row_slice = &scales[scale_row * blocks..(scale_row + 1) * blocks];
+            if expert {
+                let half_cols = cols / 2;
+                let w_row = &weights[row * half_cols..(row + 1) * half_cols];
+                for block in 0..blocks {
+                    let mut acc = 0.0f32;
+                    let w_block = &w_row[block * 16..(block + 1) * 16];
+                    let a_block = &act_values[block * 32..(block + 1) * 32];
+                    for (idx, &b) in w_block.iter().enumerate() {
+                        acc += a_block[idx * 2] * e2m1fn(b & 15);
+                        acc += a_block[idx * 2 + 1] * e2m1fn(b >> 4);
+                    }
+                    result += acc * act_scales[block] * ue8m0(scale_row_slice[block]);
                 }
-                let scale_row = if expert { row } else { row / 32 };
-                *result += acc
-                    * ue8m0(activation.scales[block])
-                    * ue8m0(scales[scale_row * blocks + block]);
+            } else {
+                let w_row = &weights[row * cols..(row + 1) * cols];
+                for block in 0..blocks {
+                    let mut acc = 0.0f32;
+                    let w_block = &w_row[block * 32..(block + 1) * 32];
+                    let a_block = &act_values[block * 32..(block + 1) * 32];
+                    for k in 0..32 {
+                        acc += a_block[k] * e4m3fn(w_block[k]);
+                    }
+                    result += acc * act_scales[block] * ue8m0(scale_row_slice[block]);
+                }
             }
-            *result = bf16::from_f32(*result).to_f32();
-        }
+            bf16::from_f32(result).to_f32()
+        };
+        let output = if rows >= 64 {
+            use rayon::prelude::*;
+            (0..rows)
+                .into_par_iter()
+                .with_min_len(64)
+                .map(compute_row)
+                .collect()
+        } else {
+            (0..rows).map(compute_row).collect()
+        };
         Ok(output)
     }
 }
@@ -346,14 +463,25 @@ pub fn dense_fp8_matvec(
     if weights.len() != count || scales.len() != scale_count || x.len() != cols {
         return Err(error("Invalid FP8 matrix, scale, or input length"));
     }
-    let mut output = vec![0.0; rows];
-    for (row, out) in output.iter_mut().enumerate() {
+    let compute_row = |row: usize| -> f32 {
+        let mut out = 0.0f32;
+        let w_row = &weights[row * cols..(row + 1) * cols];
+        let s_row = &scales[(row / 32) * col_blocks..(row / 32 + 1) * col_blocks];
         for (col, &input) in x.iter().enumerate() {
-            *out += e4m3fn(weights[row * cols + col])
-                * ue8m0(scales[(row / 32) * col_blocks + col / 32])
-                * input;
+            out += e4m3fn(w_row[col]) * ue8m0(s_row[col / 32]) * input;
         }
-    }
+        out
+    };
+    let output = if rows >= 64 {
+        use rayon::prelude::*;
+        (0..rows)
+            .into_par_iter()
+            .with_min_len(64)
+            .map(compute_row)
+            .collect()
+    } else {
+        (0..rows).map(compute_row).collect()
+    };
     Ok(output)
 }
 
@@ -376,14 +504,28 @@ pub fn expert_fp4_matvec(
     if weights.len() != count / 2 || scales.len() != scale_count || x.len() != cols {
         return Err(error("Invalid FP4 matrix, scale, or input length"));
     }
-    let mut output = vec![0.0; rows];
-    for (row, out) in output.iter_mut().enumerate() {
+    let half_cols = cols / 2;
+    let compute_row = |row: usize| -> f32 {
+        let mut out = 0.0f32;
+        let w_row = &weights[row * half_cols..(row + 1) * half_cols];
+        let s_row = &scales[row * col_blocks..(row + 1) * col_blocks];
         for (col, &input) in x.iter().enumerate() {
-            let byte = weights[row * (cols / 2) + col / 2];
+            let byte = w_row[col / 2];
             let nibble = if col % 2 == 0 { byte & 15 } else { byte >> 4 };
-            *out += e2m1fn(nibble) * ue8m0(scales[row * col_blocks + col / 32]) * input;
+            out += e2m1fn(nibble) * ue8m0(s_row[col / 32]) * input;
         }
-    }
+        out
+    };
+    let output = if rows >= 64 {
+        use rayon::prelude::*;
+        (0..rows)
+            .into_par_iter()
+            .with_min_len(64)
+            .map(compute_row)
+            .collect()
+    } else {
+        (0..rows).map(compute_row).collect()
+    };
     Ok(output)
 }
 

@@ -24,11 +24,34 @@ impl TokenizerWrapper {
             })?;
         crate::engram::compressed_vocabulary(tokenizer, expected_size)
     }
+    fn resolve_tokenizer_path(p: &Path) -> std::path::PathBuf {
+        if p.is_dir() {
+            let direct = p.join("tokenizer.json");
+            if direct.exists() {
+                return direct;
+            }
+            let meta = p.join("metadata").join("tokenizer.json");
+            if meta.exists() {
+                return meta;
+            }
+            return direct;
+        }
+        if !p.exists() {
+            if let (Some(parent), Some(name)) = (p.parent(), p.file_name()) {
+                let meta = parent.join("metadata").join(name);
+                if meta.exists() {
+                    return meta;
+                }
+            }
+        }
+        p.to_path_buf()
+    }
+
     /// Load the V4.1 tokenizer with explicit checkpoint special-token IDs.
     pub fn from_v41_file<P: AsRef<Path>>(path: P) -> Result<Self, SingularityError> {
-        let p = path.as_ref();
+        let p = Self::resolve_tokenizer_path(path.as_ref());
         let tok =
-            tokenizers::Tokenizer::from_file(p).map_err(|e| SingularityError::ModelError {
+            tokenizers::Tokenizer::from_file(&p).map_err(|e| SingularityError::ModelError {
                 reason: format!("Failed to load tokenizer from '{}': {e}", p.display()),
             })?;
         for (token, expected) in [
@@ -61,9 +84,9 @@ impl TokenizerWrapper {
     }
 
     pub fn from_file<P: AsRef<Path>>(path: P) -> Result<Self, SingularityError> {
-        let p = path.as_ref();
+        let p = Self::resolve_tokenizer_path(path.as_ref());
         let tok =
-            tokenizers::Tokenizer::from_file(p).map_err(|e| SingularityError::ModelError {
+            tokenizers::Tokenizer::from_file(&p).map_err(|e| SingularityError::ModelError {
                 reason: format!("Failed to load tokenizer from '{}': {e}", p.display()),
             })?;
 

@@ -10,18 +10,36 @@ pub struct StreamToken {
     pub is_finish: bool,
 }
 
+const DEFAULT_MAX_RETAINED_STREAMS: usize = 256;
+
+struct StreamBuffersState {
+    buffers: HashMap<u64, VecDeque<StreamToken>>,
+    order: VecDeque<u64>,
+}
+
 pub struct StreamRingBuffer {
     capacity: usize,
+    max_streams: usize,
     buffer: RwLock<VecDeque<StreamToken>>,
-    stream_buffers: RwLock<HashMap<u64, VecDeque<StreamToken>>>,
+    stream_buffers: RwLock<StreamBuffersState>,
 }
 
 impl StreamRingBuffer {
     pub fn new(capacity: usize) -> Self {
+        Self::with_max_streams(capacity, DEFAULT_MAX_RETAINED_STREAMS)
+    }
+
+    pub fn with_max_streams(capacity: usize, max_streams: usize) -> Self {
+        let capacity = capacity.max(1);
+        let max_streams = max_streams.max(1);
         Self {
             capacity,
+            max_streams,
             buffer: RwLock::new(VecDeque::with_capacity(capacity)),
-            stream_buffers: RwLock::new(HashMap::new()),
+            stream_buffers: RwLock::new(StreamBuffersState {
+                buffers: HashMap::with_capacity(max_streams.min(64)),
+                order: VecDeque::with_capacity(max_streams.min(64)),
+            }),
         }
     }
 
@@ -43,35 +61,63 @@ impl StreamRingBuffer {
     }
 
     /// Pushes a token to a specific stream buffer identified by stream_id.
+    /// Bounded to `max_streams` retained streams to prevent unbounded memory growth.
     pub fn push_for_stream(&self, stream_id: u64, token: StreamToken) {
-        let mut streams = self.stream_buffers.write();
-        let buf = streams
-            .entry(stream_id)
-            .or_insert_with(|| VecDeque::with_capacity(self.capacity));
-        if buf.len() >= self.capacity {
-            buf.pop_front();
+        {
+            let mut state = self.stream_buffers.write();
+            if !state.buffers.contains_key(&stream_id) {
+                while state.buffers.len() >= self.max_streams {
+                    if let Some(evicted_id) = state.order.pop_front() {
+                        state.buffers.remove(&evicted_id);
+                    } else {
+                        break;
+                    }
+                }
+                state.order.push_back(stream_id);
+            }
+            let buf = state
+                .buffers
+                .entry(stream_id)
+                .or_insert_with(|| VecDeque::with_capacity(self.capacity));
+            if buf.back().is_some_and(|last| last.seq_no >= token.seq_no) {
+                buf.clear();
+            }
+            if buf.len() >= self.capacity {
+                buf.pop_front();
+            }
+            buf.push_back(token.clone());
         }
-        buf.push_back(token.clone());
-        drop(streams);
         // Also mirror to global buffer for backward compatibility
         self.push(token);
     }
 
+    pub fn has_stream(&self, stream_id: u64) -> bool {
+        self.stream_buffers.read().buffers.contains_key(&stream_id)
+    }
+
     /// Replays tokens for a specific stream following the specified last_seq_no.
     pub fn replay_since_for_stream(&self, stream_id: u64, last_seq_no: u64) -> Vec<StreamToken> {
-        let streams = self.stream_buffers.read();
-        if let Some(buf) = streams.get(&stream_id) {
+        let state = self.stream_buffers.read();
+        if let Some(buf) = state.buffers.get(&stream_id) {
             buf.iter()
                 .filter(|t| t.seq_no > last_seq_no)
                 .cloned()
                 .collect()
         } else {
+            drop(state);
             self.replay_since(last_seq_no)
         }
     }
 
     pub fn remove_stream(&self, stream_id: u64) {
-        self.stream_buffers.write().remove(&stream_id);
+        let mut state = self.stream_buffers.write();
+        if state.buffers.remove(&stream_id).is_some() {
+            state.order.retain(|&id| id != stream_id);
+        }
+    }
+
+    pub fn retained_stream_count(&self) -> usize {
+        self.stream_buffers.read().buffers.len()
     }
 
     pub fn all_tokens(&self) -> Vec<StreamToken> {

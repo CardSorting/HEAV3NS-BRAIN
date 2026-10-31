@@ -1,10 +1,12 @@
 use half::{bf16, f16};
 use memmap2::Mmap;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use singularity_core::SingularityError;
 use singularity_cuda::{GpuBackend, GpuBuffer};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 /// Parse JSON while rejecting duplicate keys at every nesting level. A normal
@@ -73,6 +75,91 @@ impl<'de> Deserialize<'de> for StrictJson {
     }
 }
 
+pub const CSF_SCHEMA: &str = "lil-mxfp4-csf-checkpoint/1";
+pub const CSF_CODEC: &str = "row-base-offset1-u24-exceptions/1";
+const CSF_FIXED_SUFFIX: &str = ".mxfp4_csf_fixed";
+const CSF_EXCEPTIONS_SUFFIX: &str = ".mxfp4_csf_exceptions";
+
+/// Decode a `row-base-offset1-u24-exceptions/1` compressed `F8_E8M0` scale tensor
+/// into its bit-exact `[rows, cols]` uncompressed representation.
+pub fn decode_mxfp4_csf_scale(
+    fixed: &[u8],
+    exceptions: &[u8],
+    rows: usize,
+    cols: usize,
+) -> Result<Vec<u8>, SingularityError> {
+    if rows == 0 || cols == 0 || cols % 8 != 0 {
+        return Err(SingularityError::ModelError {
+            reason: format!(
+                "Invalid CSF scale dimensions [{rows}, {cols}]: rows must be > 0 and cols a positive multiple of 8"
+            ),
+        });
+    }
+    let row_bytes = cols / 8;
+    let expected_fixed_len =
+        rows.checked_mul(1 + row_bytes)
+            .ok_or_else(|| SingularityError::ModelError {
+                reason: "CSF fixed byte length overflow".into(),
+            })?;
+    if fixed.len() != expected_fixed_len {
+        return Err(SingularityError::ModelError {
+            reason: format!(
+                "Invalid CSF fixed payload size: expected {expected_fixed_len} bytes for [{rows}, {cols}], got {}",
+                fixed.len()
+            ),
+        });
+    }
+    if exceptions.len() % 4 != 0 {
+        return Err(SingularityError::ModelError {
+            reason: format!(
+                "Invalid CSF exceptions payload size {}: must be a multiple of 4",
+                exceptions.len()
+            ),
+        });
+    }
+    let total_elems = rows
+        .checked_mul(cols)
+        .ok_or_else(|| SingularityError::ModelError {
+            reason: "CSF scale element count overflow".into(),
+        })?;
+    let mut out = vec![0u8; total_elems];
+    let mut pos = 0usize;
+    for b_start in (0..rows).step_by(16) {
+        let blk_rows = (rows - b_start).min(16);
+        let bases = &fixed[pos..pos + blk_rows];
+        pos += blk_rows;
+        let bits_len = blk_rows * row_bytes;
+        let bits = &fixed[pos..pos + bits_len];
+        pos += bits_len;
+        for r_in in 0..blk_rows {
+            let base = bases[r_in];
+            let row_bits = &bits[r_in * row_bytes..(r_in + 1) * row_bytes];
+            let row_out = &mut out[(b_start + r_in) * cols..(b_start + r_in + 1) * cols];
+            for (byte_idx, &b) in row_bits.iter().enumerate() {
+                let col_base = byte_idx * 8;
+                for bit_idx in 0..8 {
+                    let bit = (b >> bit_idx) & 1;
+                    row_out[col_base + bit_idx] = base.wrapping_add(bit);
+                }
+            }
+        }
+    }
+    for chunk in exceptions.chunks_exact(4) {
+        let word = u32::from_le_bytes(chunk.try_into().unwrap());
+        let idx = (word & 0x00FF_FFFF) as usize;
+        let val = (word >> 24) as u8;
+        if idx >= total_elems {
+            return Err(SingularityError::ModelError {
+                reason: format!(
+                    "CSF exception flat index {idx} out of bounds for scale tensor of {total_elems} elements"
+                ),
+            });
+        }
+        out[idx] = val;
+    }
+    Ok(out)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TensorInfo {
     pub dtype: String,
@@ -87,11 +174,20 @@ struct IndexManifest {
     weight_map: HashMap<String, String>,
 }
 
+struct CsfScaleEntry {
+    fixed_offsets: (usize, usize),
+    exceptions_offsets: (usize, usize),
+    rows: usize,
+    cols: usize,
+    decoded: std::sync::OnceLock<Vec<u8>>,
+}
+
 struct ShardEntry {
     _path: PathBuf,
     mmap: Mmap,
     header_len: usize,
     tensors: HashMap<String, TensorInfo>,
+    csf_scales: HashMap<String, CsfScaleEntry>,
 }
 
 pub struct SafetensorsMmapLoader {
@@ -108,13 +204,17 @@ impl SafetensorsMmapLoader {
             if index_path.exists() {
                 return Self::open_index(&index_path);
             }
+            let meta_index_path = p.join("metadata").join("model.safetensors.index.json");
+            if meta_index_path.exists() {
+                return Self::open_index(&meta_index_path);
+            }
             let single_path = p.join("model.safetensors");
             if single_path.exists() {
                 return Self::open_single_file(&single_path);
             }
             return Err(SingularityError::ModelError {
                 reason: format!(
-                    "Directory '{}' contains neither model.safetensors.index.json nor model.safetensors",
+                    "Directory '{}' contains neither model.safetensors.index.json, metadata/model.safetensors.index.json, nor model.safetensors",
                     p.display()
                 ),
             });
@@ -126,6 +226,30 @@ impl SafetensorsMmapLoader {
         } else {
             Self::open_single_file(p)
         }
+    }
+
+    fn resolve_shard_path(parent_dir: &Path, shard_name: &str) -> PathBuf {
+        let direct = parent_dir.join(shard_name);
+        if direct.exists() {
+            return direct;
+        }
+        let in_tensors = parent_dir.join("tensors").join(shard_name);
+        if in_tensors.exists() {
+            return in_tensors;
+        }
+        if parent_dir.file_name().and_then(|n| n.to_str()) == Some("metadata") {
+            if let Some(root_dir) = parent_dir.parent() {
+                let root_direct = root_dir.join(shard_name);
+                if root_direct.exists() {
+                    return root_direct;
+                }
+                let root_tensors = root_dir.join("tensors").join(shard_name);
+                if root_tensors.exists() {
+                    return root_tensors;
+                }
+            }
+        }
+        direct
     }
 
     fn open_single_file(path: &Path) -> Result<Self, SingularityError> {
@@ -170,7 +294,8 @@ impl SafetensorsMmapLoader {
 
     fn open_index(index_path: &Path) -> Result<Self, SingularityError> {
         let file = File::open(index_path)?;
-        let StrictJson(root) = serde_json::from_reader(file)?;
+        let reader = BufReader::with_capacity(1024 * 1024, file);
+        let StrictJson(root) = serde_json::from_reader(reader)?;
         let manifest: IndexManifest = serde_json::from_value(root)?;
         let parent_dir = index_path.parent().unwrap_or_else(|| Path::new("."));
 
@@ -183,15 +308,28 @@ impl SafetensorsMmapLoader {
             }
         }
 
-        let mut shards = Vec::new();
-        let mut shard_name_to_idx = HashMap::new();
-
-        for (idx, shard_name) in unique_shards.iter().enumerate() {
-            let shard_path = parent_dir.join(shard_name);
-            let shard = Self::parse_single_shard(&shard_path)?;
-            shards.push(shard);
-            shard_name_to_idx.insert(shard_name.clone(), idx);
-        }
+        let shards: Vec<ShardEntry> = if unique_shards.len() > 1 {
+            unique_shards
+                .par_iter()
+                .map(|shard_name| {
+                    let shard_path = Self::resolve_shard_path(parent_dir, shard_name);
+                    Self::parse_single_shard(&shard_path)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            unique_shards
+                .iter()
+                .map(|shard_name| {
+                    let shard_path = Self::resolve_shard_path(parent_dir, shard_name);
+                    Self::parse_single_shard(&shard_path)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let shard_name_to_idx: HashMap<String, usize> = unique_shards
+            .into_iter()
+            .enumerate()
+            .map(|(idx, name)| (name, idx))
+            .collect();
 
         let mut weight_to_shard = HashMap::new();
         for (weight_name, shard_file) in manifest.weight_map {
@@ -332,11 +470,120 @@ impl SafetensorsMmapLoader {
             });
         }
 
+        // Reconcile lil-mxfp4-csf-checkpoint/1 scale tensor pairs (.mxfp4_csf_fixed + .mxfp4_csf_exceptions)
+        let fixed_keys: Vec<String> = tensors
+            .keys()
+            .filter(|k| k.ends_with(CSF_FIXED_SUFFIX))
+            .cloned()
+            .collect();
+        let mut csf_scales = HashMap::new();
+        for fixed_key in fixed_keys {
+            let logical_name = fixed_key
+                .strip_suffix(CSF_FIXED_SUFFIX)
+                .unwrap()
+                .to_string();
+            let exc_key = format!("{logical_name}{CSF_EXCEPTIONS_SUFFIX}");
+            let fixed_info = tensors.remove(&fixed_key).unwrap();
+            let exc_info = tensors
+                .remove(&exc_key)
+                .ok_or_else(|| SingularityError::ModelError {
+                    reason: format!(
+                        "Missing companion CSF exceptions tensor '{exc_key}' in '{}'",
+                        path.display()
+                    ),
+                })?;
+            if fixed_info.dtype != "U8"
+                || fixed_info.shape.len() != 1
+                || exc_info.dtype != "U32"
+                || exc_info.shape.len() != 1
+            {
+                return Err(SingularityError::ModelError {
+                    reason: format!(
+                        "Invalid CSF tensor dtypes/shapes for '{logical_name}' in '{}'",
+                        path.display()
+                    ),
+                });
+            }
+            let prefix = logical_name
+                .strip_suffix(".scale")
+                .ok_or_else(|| SingularityError::ModelError {
+                    reason: format!(
+                        "CSF compressed tensor '{logical_name}' does not end with '.scale'"
+                    ),
+                })?;
+            let weight_name = format!("{prefix}.weight");
+            let weight_info = tensors.get(&weight_name).ok_or_else(|| {
+                SingularityError::ModelError {
+                    reason: format!(
+                        "Missing companion weight tensor '{weight_name}' for CSF scale '{logical_name}' in '{}'",
+                        path.display()
+                    ),
+                }
+            })?;
+            if weight_info.shape.len() != 2
+                || weight_info.shape[0] == 0
+                || weight_info.shape[1] == 0
+                || weight_info.shape[1] % 16 != 0
+            {
+                return Err(SingularityError::ModelError {
+                    reason: format!(
+                        "Invalid companion weight shape {:?} for CSF scale '{logical_name}'",
+                        weight_info.shape
+                    ),
+                });
+            }
+            let rows = weight_info.shape[0];
+            let cols = weight_info.shape[1] / 16;
+            if cols % 8 != 0 || rows.checked_mul(1 + cols / 8) != Some(fixed_info.shape[0]) {
+                return Err(SingularityError::ModelError {
+                    reason: format!(
+                        "CSF fixed length {} does not match [{rows}, {cols}] for '{logical_name}'",
+                        fixed_info.shape[0]
+                    ),
+                });
+            }
+            if tensors.contains_key(&logical_name) {
+                return Err(SingularityError::ModelError {
+                    reason: format!(
+                        "Duplicate logical scale tensor '{logical_name}' in '{}'",
+                        path.display()
+                    ),
+                });
+            }
+            tensors.insert(
+                logical_name.clone(),
+                TensorInfo {
+                    dtype: "F8_E8M0".to_string(),
+                    shape: vec![rows, cols],
+                    data_offsets: (0, rows * cols),
+                },
+            );
+            csf_scales.insert(
+                logical_name,
+                CsfScaleEntry {
+                    fixed_offsets: fixed_info.data_offsets,
+                    exceptions_offsets: exc_info.data_offsets,
+                    rows,
+                    cols,
+                    decoded: std::sync::OnceLock::new(),
+                },
+            );
+        }
+        if let Some(orphan) = tensors.keys().find(|k| k.ends_with(CSF_EXCEPTIONS_SUFFIX)) {
+            return Err(SingularityError::ModelError {
+                reason: format!(
+                    "Orphaned CSF exceptions tensor '{orphan}' without matching '{CSF_FIXED_SUFFIX}' in '{}'",
+                    path.display()
+                ),
+            });
+        }
+
         Ok(ShardEntry {
             _path: path.to_path_buf(),
             mmap,
             header_len,
             tensors,
+            csf_scales,
         })
     }
 
@@ -347,6 +594,13 @@ impl SafetensorsMmapLoader {
     pub fn get_tensor_info(&self, name: &str) -> Option<&TensorInfo> {
         let shard_idx = *self.weight_to_shard.get(name)?;
         self.shards.get(shard_idx)?.tensors.get(name)
+    }
+
+    pub fn is_csf_scale(&self, name: &str) -> bool {
+        self.weight_to_shard
+            .get(name)
+            .and_then(|&idx| self.shards.get(idx))
+            .is_some_and(|shard| shard.csf_scales.contains_key(name))
     }
 
     pub fn get_metadata(&self, key: &str) -> Option<&String> {
@@ -365,6 +619,29 @@ impl SafetensorsMmapLoader {
         })?;
 
         let shard = &self.shards[shard_idx];
+        if let Some(csf_entry) = shard.csf_scales.get(name) {
+            if let Some(decoded) = csf_entry.decoded.get() {
+                return Ok(decoded.as_slice());
+            }
+            let fixed_start = 8 + shard.header_len + csf_entry.fixed_offsets.0;
+            let fixed_end = 8 + shard.header_len + csf_entry.fixed_offsets.1;
+            let exc_start = 8 + shard.header_len + csf_entry.exceptions_offsets.0;
+            let exc_end = 8 + shard.header_len + csf_entry.exceptions_offsets.1;
+            if fixed_end > shard.mmap.len() || exc_end > shard.mmap.len() {
+                return Err(SingularityError::ModelError {
+                    reason: format!("CSF scale '{name}' offsets exceed mmap boundary"),
+                });
+            }
+            let decoded = decode_mxfp4_csf_scale(
+                &shard.mmap[fixed_start..fixed_end],
+                &shard.mmap[exc_start..exc_end],
+                csf_entry.rows,
+                csf_entry.cols,
+            )?;
+            let _ = csf_entry.decoded.set(decoded);
+            return Ok(csf_entry.decoded.get().unwrap().as_slice());
+        }
+
         let info = shard
             .tensors
             .get(name)
@@ -603,6 +880,118 @@ mod tests {
         )
         .unwrap();
         assert!(SafetensorsMmapLoader::open(index).is_err());
+    }
+
+    #[test]
+    fn test_decode_mxfp4_csf_scale_and_loader_csf_layout() {
+        // Test 18 rows x 8 cols (spans two 16-row blocks: 16 rows + 2 rows)
+        let rows = 18usize;
+        let cols = 8usize;
+        let mut expected = vec![0u8; rows * cols];
+        let mut fixed = Vec::new();
+        for b_start in (0..rows).step_by(16) {
+            let blk_rows = (rows - b_start).min(16);
+            for r_in in 0..blk_rows {
+                let r = b_start + r_in;
+                fixed.push(120u8 + r as u8);
+            }
+            for r_in in 0..blk_rows {
+                let r = b_start + r_in;
+                let base = 120u8 + r as u8;
+                let mask: u8 = if r % 2 == 0 { 0b1010_0101 } else { 0b0101_1010 };
+                fixed.push(mask);
+                for c in 0..cols {
+                    let bit = (mask >> c) & 1;
+                    expected[r * cols + c] = base + bit;
+                }
+            }
+        }
+        // Override two exception positions: (row=0, col=3) -> 135, (row=17, col=7) -> 111
+        let exc0_idx: u32 = 3;
+        let exc1_idx: u32 = (17 * cols + 7) as u32;
+        expected[exc0_idx as usize] = 135;
+        expected[exc1_idx as usize] = 111;
+        let mut exceptions = Vec::new();
+        exceptions.extend_from_slice(&(exc0_idx | (135u32 << 24)).to_le_bytes());
+        exceptions.extend_from_slice(&(exc1_idx | (111u32 << 24)).to_le_bytes());
+
+        let decoded = decode_mxfp4_csf_scale(&fixed, &exceptions, rows, cols).unwrap();
+        assert_eq!(decoded, expected);
+
+        // Out-of-bounds exception index should fail
+        let bad_exc = ((rows * cols) as u32 | (127u32 << 24)).to_le_bytes();
+        assert!(decode_mxfp4_csf_scale(&fixed, &bad_exc, rows, cols).is_err());
+
+        // Now test full SafetensorsMmapLoader with CSF directory layout:
+        // metadata/model.safetensors.index.json + tensors/model-00001-of-00001.safetensors
+        let dir = tempdir().unwrap();
+        let meta_dir = dir.path().join("metadata");
+        let tensors_dir = dir.path().join("tensors");
+        std::fs::create_dir_all(&meta_dir).unwrap();
+        std::fs::create_dir_all(&tensors_dir).unwrap();
+
+        let weight_shape = [rows, cols * 16]; // [18, 128] -> scale shape [18, 8]
+        let weight_bytes = vec![0x21u8; weight_shape[0] * weight_shape[1]];
+        let w_end = weight_bytes.len();
+        let f_end = w_end + fixed.len();
+        let e_end = f_end + exceptions.len();
+
+        let shard_header = serde_json::json!({
+            "__metadata__": {
+                "schema": CSF_SCHEMA,
+                "codec": CSF_CODEC
+            },
+            "layers.0.ffn.experts.0.w1.weight": {
+                "dtype": "I8",
+                "shape": [weight_shape[0], weight_shape[1]],
+                "data_offsets": [0, w_end]
+            },
+            "layers.0.ffn.experts.0.w1.scale.mxfp4_csf_fixed": {
+                "dtype": "U8",
+                "shape": [fixed.len()],
+                "data_offsets": [w_end, f_end]
+            },
+            "layers.0.ffn.experts.0.w1.scale.mxfp4_csf_exceptions": {
+                "dtype": "U32",
+                "shape": [exceptions.len() / 4],
+                "data_offsets": [f_end, e_end]
+            }
+        });
+        let shard_header_bytes = serde_json::to_vec(&shard_header).unwrap();
+        let mut shard_file = (shard_header_bytes.len() as u64).to_le_bytes().to_vec();
+        shard_file.extend_from_slice(&shard_header_bytes);
+        shard_file.extend_from_slice(&weight_bytes);
+        shard_file.extend_from_slice(&fixed);
+        shard_file.extend_from_slice(&exceptions);
+        std::fs::write(
+            tensors_dir.join("model-00001-of-00001.safetensors"),
+            &shard_file,
+        )
+        .unwrap();
+
+        let index_json = serde_json::json!({
+            "metadata": {"total_size": weight_bytes.len() + expected.len()},
+            "weight_map": {
+                "layers.0.ffn.experts.0.w1.weight": "model-00001-of-00001.safetensors",
+                "layers.0.ffn.experts.0.w1.scale": "model-00001-of-00001.safetensors"
+            }
+        });
+        std::fs::write(
+            meta_dir.join("model.safetensors.index.json"),
+            serde_json::to_vec(&index_json).unwrap(),
+        )
+        .unwrap();
+
+        let loader = SafetensorsMmapLoader::open(dir.path()).unwrap();
+        let scale_info = loader
+            .get_tensor_info("layers.0.ffn.experts.0.w1.scale")
+            .unwrap();
+        assert_eq!(scale_info.dtype, "F8_E8M0");
+        assert_eq!(scale_info.shape, vec![rows, cols]);
+        let loaded_scale = loader
+            .get_tensor_bytes("layers.0.ffn.experts.0.w1.scale")
+            .unwrap();
+        assert_eq!(loaded_scale, expected.as_slice());
     }
 
     #[test]

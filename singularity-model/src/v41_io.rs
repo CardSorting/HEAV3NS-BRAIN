@@ -73,6 +73,22 @@ impl<'a> TokenIo<'a> {
         HcState::from_embedding(&values, self.streams)
     }
 
+    /// Initialize independent residual streams from a precomputed embedding (e.g. aligned vision span).
+    pub fn embed_custom(&self, embedding: &[f32]) -> Result<HcState, SingularityError> {
+        if embedding.len() != self.hidden {
+            return Err(error("Custom embedding dimension mismatch"));
+        }
+        let values: Vec<f32> = embedding
+            .iter()
+            .map(|&v| bf16::from_f32(v).to_f32())
+            .collect();
+        HcState::from_embedding(&values, self.streams)
+    }
+
+    pub fn hidden_size(&self) -> usize {
+        self.hidden
+    }
+
     /// Collapse the final shifted HC state, normalize in BF16, and compute FP32 logits.
     pub fn logits(&self, state: &HcState) -> Result<Vec<f32>, SingularityError> {
         if state.residual.len() != self.streams * self.hidden
@@ -83,16 +99,31 @@ impl<'a> TokenIo<'a> {
         let collapsed = hc_pre(&state.residual, &state.next_pre, self.hidden, true)?;
         let input = self.norm.forward(&collapsed, true)?;
         let row_bytes = self.hidden * 2;
-        Ok(self
-            .head
-            .chunks_exact(row_bytes)
-            .map(|row| {
-                row.chunks_exact(2)
-                    .zip(&input)
-                    .map(|(b, x)| bf16::from_le_bytes([b[0], b[1]]).to_f32() * x)
-                    .sum::<f32>()
-            })
-            .collect())
+        if self.vocab >= 64 {
+            use rayon::prelude::*;
+            Ok(self
+                .head
+                .par_chunks_exact(row_bytes)
+                .with_min_len(256)
+                .map(|row| {
+                    row.chunks_exact(2)
+                        .zip(&input)
+                        .map(|(b, x)| bf16::from_le_bytes([b[0], b[1]]).to_f32() * x)
+                        .sum::<f32>()
+                })
+                .collect())
+        } else {
+            Ok(self
+                .head
+                .chunks_exact(row_bytes)
+                .map(|row| {
+                    row.chunks_exact(2)
+                        .zip(&input)
+                        .map(|(b, x)| bf16::from_le_bytes([b[0], b[1]]).to_f32() * x)
+                        .sum::<f32>()
+                })
+                .collect())
+        }
     }
 }
 

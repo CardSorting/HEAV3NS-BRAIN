@@ -103,9 +103,17 @@ pub fn candidate_blocks(
     if reachable > 0 {
         ranks[(reachable - 1) / block_size].1 = f32::INFINITY;
     }
-    ranks.sort_unstable_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
     let mut selected = vec![false; scores.len()];
-    for (block, score) in ranks.into_iter().take(top_blocks) {
+    let keep = top_blocks.min(ranks.len());
+    if keep == 0 {
+        return Ok(selected);
+    }
+    let cmp = |a: &(usize, f32), b: &(usize, f32)| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0));
+    if keep < ranks.len() {
+        ranks.select_nth_unstable_by(keep - 1, cmp);
+        ranks.truncate(keep);
+    }
+    for (block, score) in ranks {
         if score == f32::NEG_INFINITY {
             continue;
         }
@@ -135,6 +143,9 @@ pub fn compressed_topk(
         return Err(error("Invalid compressed top-k input"));
     }
     let width = top_k.min(scores.len());
+    if width == 0 {
+        return Ok(Vec::new());
+    }
     let score = |index: usize| {
         if index >= reachable || candidate_mask.is_some_and(|mask| !mask[index]) {
             f32::NEG_INFINITY
@@ -143,8 +154,12 @@ pub fn compressed_topk(
         }
     };
     let mut selected: Vec<usize> = (0..scores.len()).collect();
-    selected.sort_unstable_by(|&a, &b| score(b).total_cmp(&score(a)).then(a.cmp(&b)));
-    selected.truncate(width);
+    if width < selected.len() {
+        selected.select_nth_unstable_by(width - 1, |&a, &b| {
+            score(b).total_cmp(&score(a)).then(a.cmp(&b))
+        });
+        selected.truncate(width);
+    }
     selected.sort_unstable();
     let mut out = Vec::with_capacity(width);
     for index in selected {
@@ -334,9 +349,10 @@ pub fn sparse_attention_kernel_reference(
         let mut denom = 0.0f32;
         let out = &mut output[head * dim..(head + 1) * dim];
         for block in indices.chunks(64) {
-            let scores: Vec<f32> = block
-                .iter()
-                .map(|idx| match idx {
+            let mut scores_buf = [0.0f32; 64];
+            let mut new_max = max;
+            for (slot, idx) in scores_buf[..block.len()].iter_mut().zip(block.iter()) {
+                let score = match idx {
                     Some(i) => {
                         query
                             .iter()
@@ -346,15 +362,16 @@ pub fn sparse_attention_kernel_reference(
                             * scale
                     }
                     None => f32::NEG_INFINITY,
-                })
-                .collect();
-            let new_max = scores.iter().copied().fold(max, f32::max);
+                };
+                *slot = score;
+                new_max = new_max.max(score);
+            }
             let rescale = (max - new_max).exp();
             denom *= rescale;
             for value in out.iter_mut() {
                 *value *= rescale;
             }
-            for (&index, score) in block.iter().zip(scores) {
+            for (&index, &score) in block.iter().zip(&scores_buf[..block.len()]) {
                 let probability = (score - new_max).exp();
                 denom += probability;
                 if let Some(index) = index {

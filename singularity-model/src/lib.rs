@@ -1,3 +1,8 @@
+#![cfg_attr(
+    test,
+    allow(clippy::useless_vec, clippy::unnecessary_cast, clippy::manual_div_ceil)
+)]
+
 pub mod attention;
 pub mod engram;
 pub mod moe;
