@@ -39,11 +39,7 @@ pub enum ThinkingMode {
     Thinking,
 }
 
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
+use crate::model_error as error;
 
 /// Encode the text-only conversation using the reference's default
 /// `drop_thinking=true`, with an explicit numeric reasoning budget.

@@ -1,5 +1,6 @@
 //! Checkpoint-specific DSpark input and draft head CPU reference.
 //! Draft attention stages and target verification are not implemented here.
+use crate::model_error as error;
 use crate::{
     v41_block::RmsNorm,
     v41_compressor::Bf16Matrix,
@@ -10,11 +11,6 @@ use crate::{
     SafetensorsMmapLoader,
 };
 use singularity_core::SingularityError;
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
 
 /// One checkpoint DSpark stage. Draft attention sees the entire draft block;
 /// each token then independently passes through the stage's routed experts.
@@ -237,13 +233,13 @@ pub fn generate_verified_greedy(
         itl_ns_list: Vec::with_capacity(max_new_tokens.saturating_sub(1)),
     };
     let mut last_token_time = t_start;
-    let record_token =
-        |res: &mut VerifiedGreedyOutput, tok: u32, last: &mut std::time::Instant| {
-            let now = std::time::Instant::now();
+    let record_token = |res: &mut VerifiedGreedyOutput, tok: u32, last: &mut std::time::Instant| {
+        let now = std::time::Instant::now();
         if res.tokens.is_empty() {
             res.ttft_ns = now.duration_since(t_start).as_nanos() as u64;
         } else {
-            res.itl_ns_list.push(now.duration_since(*last).as_nanos() as u64);
+            res.itl_ns_list
+                .push(now.duration_since(*last).as_nanos() as u64);
         }
         *last = now;
         res.tokens.push(tok);

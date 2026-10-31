@@ -1,13 +1,9 @@
 //! Text and tool conversation serialization for the V4.1 checkpoint protocol.
+use crate::model_error as error;
 use crate::v41_prompt::{ThinkingMode, BOS, EOS};
 use crate::v41_tools::{encode_calls, ToolCall};
 use singularity_core::SingularityError;
 use std::collections::HashMap;
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
 
 #[derive(Debug, Clone)]
 pub struct Invocation {

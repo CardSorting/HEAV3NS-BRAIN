@@ -49,6 +49,8 @@ if __package__ in (None, ""):
         CSF_MODEL_ID,
         CSF_PINNED_REVISION,
         DeploymentConfig,
+        GPU_COUNT,
+        KNOWN_APP_NAMES,
         MODEL_ID,
         VOLUME_NAME,
     )
@@ -63,6 +65,8 @@ if __package__ in (None, ""):
         download_pinned_checkpoint,
         validate_checkpoint_directory,
     )
+    from deploy.modal.config import resolve_scaling_policy
+    from deploy.modal.ops import ModalProvider, audit, measure_cold_start, status
 else:
     from .app import STARTUP_SEQUENCE_STEPS, build_singularity_serve_command
     from .benchmark import run_benchmark_suite
@@ -73,6 +77,8 @@ else:
         CSF_MODEL_ID,
         CSF_PINNED_REVISION,
         DeploymentConfig,
+        GPU_COUNT,
+        KNOWN_APP_NAMES,
         MODEL_ID,
         VOLUME_NAME,
     )
@@ -80,6 +86,8 @@ else:
     from .health import check_service_health, run_smoke_inference, verify_gpu_topology
     from .image import validate_workspace_sources
     from .model_storage import download_pinned_checkpoint, validate_checkpoint_directory
+    from .config import resolve_scaling_policy
+    from .ops import ModalProvider, audit, measure_cold_start, status
 
 ALL_LIFECYCLE_COMMANDS: List[str] = [
     "build-image",
@@ -98,6 +106,11 @@ ALL_LIFECYCLE_COMMANDS: List[str] = [
     "stop",
     "validate-gpu",
 ]
+
+
+# Scale-to-zero operations added by singularity3.md (kept separate: the 15-command set above
+# is the singularity2.md contract and is asserted by tests).
+SCALE_TO_ZERO_COMMANDS: List[str] = ["status", "audit", "measure-cold-start", "teardown"]
 
 
 def _resolve_modal_bin() -> str:
@@ -196,17 +209,61 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("restart", help="Restart the deployed Modal service container")
     sub.add_parser("update", help="Rebuild and roll out an updated SINGULARITY service deployment")
-    sub.add_parser("stop", help="Stop the deployed Modal service")
+    sp = sub.add_parser("stop", help="Stop the deployed Modal service")
+    sp.add_argument("--app-name", default=APP_NAME, help="Modal app name to stop (default: primary service)")
+    sp.add_argument("--all", action="store_true", help="Stop all known SINGULARITY Modal apps")
+    sub.add_parser("teardown", help="Stop all known SINGULARITY Modal apps and terminate any orphaned containers")
     sub.add_parser("validate-gpu", help="Run SM 10.0 nvcc + PTX validation on B200 via gpu_validation.py")
+
+    st = sub.add_parser("status", help="Policy + provider-side zero-compute check (+ optional live container lifecycle)")
+    st.add_argument("--url", default=None, help="Deployed endpoint; querying it counts as activity")
+
+    au = sub.add_parser("audit", help="List provider containers, detect orphans; --terminate-orphans stops them")
+    au.add_argument("--terminate-orphans", action="store_true", help="Actually stop orphaned containers (default: report only)")
+
+    cs = sub.add_parser("measure-cold-start", help="Measure first-request (cold) vs warm TTFT on an endpoint")
+    cs.add_argument("--url", required=True)
+    cs.add_argument("--model", default=MODEL_ID)
+    cs.add_argument("--api-key", default=None)
+    cs.add_argument("--warm-requests", type=int, default=3)
+    cs.add_argument("--timeout", type=float, default=300.0, help="Per-request client timeout in seconds")
+    cs.add_argument("--gpu-count", type=int, default=GPU_COUNT, help="GPU count for report attribution")
+    cs.add_argument("--output", default=None)
 
     return parser
 
 
-def execute_command(argv: Optional[List[str]] = None) -> Dict[str, object]:
+def execute_command(
+    argv: Optional[List[str]] = None, *, provider: Optional[ModalProvider] = None
+) -> Dict[str, object]:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     dry_run: bool = bool(args.dry_run)
     cmd: str = args.command
+
+    if cmd in ("status", "audit"):
+        policy = resolve_scaling_policy()
+        prov = provider or ModalProvider()
+        if cmd == "audit":
+            if args.terminate_orphans and dry_run:
+                return {"status": "dry_run", "note": "would terminate orphans after listing"}
+            return audit(prov, policy, terminate_orphans=bool(args.terminate_orphans))
+        return status(prov, policy, url=args.url)
+
+    if cmd == "measure-cold-start":
+        if dry_run:
+            return {"status": "dry_run", "url": args.url}
+        report = measure_cold_start(
+            args.url,
+            model=args.model,
+            api_key=args.api_key,
+            warm_requests=args.warm_requests,
+            timeout=args.timeout,
+            gpu_count=args.gpu_count,
+        )
+        if args.output:
+            Path(args.output).write_text(json.dumps(report, indent=2))
+        return report
 
     if cmd == "validate-image":
         return validate_workspace_sources()
@@ -250,11 +307,19 @@ def execute_command(argv: Optional[List[str]] = None) -> Dict[str, object]:
                 "checkpoint_dir": args.checkpoint_dir,
                 "strict_pinned": not args.non_strict,
             }
-        return validate_checkpoint_directory(
+        vc_result = validate_checkpoint_directory(
             args.checkpoint_dir,
             strict_pinned=not args.non_strict,
             verify_shard_headers=True,
         )
+        if isinstance(vc_result, dict) and any(
+            "does not exist" in str(e) for e in vc_result.get("errors", [])
+        ):
+            vc_result["hint"] = (
+                "This command validates a LOCAL path only. The Modal Volume is not mounted "
+                "here; use `modal volume ls <volume> <dir>` to inspect remote contents."
+            )
+        return vc_result
 
     if cmd == "deploy":
         primary = _run_modal_cli(["deploy", "deploy/modal/app.py"], dry_run=dry_run)
@@ -305,7 +370,7 @@ def execute_command(argv: Optional[List[str]] = None) -> Dict[str, object]:
         )
 
     if cmd == "restart":
-        stop_res = _run_modal_cli(["app", "stop", APP_NAME], dry_run=dry_run)
+        stop_res = _run_modal_cli(["app", "stop", "--yes", APP_NAME], dry_run=dry_run)
         deploy_res = _run_modal_cli(["deploy", "deploy/modal/app.py"], dry_run=dry_run)
         return {"status": "restarted" if not dry_run else "dry_run", "stop": stop_res, "deploy": deploy_res}
 
@@ -313,7 +378,38 @@ def execute_command(argv: Optional[List[str]] = None) -> Dict[str, object]:
         return _run_modal_cli(["deploy", "deploy/modal/app.py"], dry_run=dry_run)
 
     if cmd == "stop":
-        return _run_modal_cli(["app", "stop", APP_NAME], dry_run=dry_run)
+        if getattr(args, "all", False):
+            stopped = []
+            for name in KNOWN_APP_NAMES:
+                try:
+                    stopped.append(_run_modal_cli(["app", "stop", "--yes", name], dry_run=dry_run))
+                except RuntimeError as exc:
+                    stopped.append({"app": name, "status": "skipped_or_not_deployed", "detail": str(exc)})
+            return {"status": "stopped_all" if not dry_run else "dry_run", "apps": stopped}
+        target_app = getattr(args, "app_name", APP_NAME) or APP_NAME
+        return _run_modal_cli(["app", "stop", "--yes", target_app], dry_run=dry_run)
+
+    if cmd == "teardown":
+        if dry_run:
+            return {
+                "status": "dry_run",
+                "apps": list(KNOWN_APP_NAMES),
+                "terminate_orphans": True,
+            }
+        stopped_apps = []
+        for name in KNOWN_APP_NAMES:
+            try:
+                stopped_apps.append(_run_modal_cli(["app", "stop", "--yes", name], dry_run=False))
+            except Exception as exc:  # noqa: BLE001
+                stopped_apps.append({"app": name, "status": "not_running", "detail": str(exc)})
+        policy = resolve_scaling_policy()
+        prov = provider or ModalProvider()
+        audit_rep = audit(prov, policy, terminate_orphans=True)
+        return {
+            "status": "torn_down",
+            "stopped_apps": stopped_apps,
+            "audit": audit_rep,
+        }
 
     if cmd == "validate-gpu":
         return _run_modal_cli(["run", "deploy/modal/gpu_validation.py"], dry_run=dry_run)

@@ -134,7 +134,6 @@ pub struct CompletionRequest {
     pub dspark: Option<bool>,
 }
 
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletionChoice {
     pub index: usize,
@@ -222,11 +221,18 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
     let cb_state = state.circuit_breaker.current_state();
     let free_blocks = state.block_manager.free_block_count();
     let total_blocks = state.block_manager.total_blocks();
-    let readiness = state.readiness();
+    let mut readiness = state.readiness();
+    let fatal_err = state.scheduler.fatal().map(|e| e.to_string());
+    let poisoned = fatal_err.is_some();
+    if poisoned {
+        readiness.distributed_topology_operational = false;
+    }
 
     Json(serde_json::json!({
-        "status": "healthy",
-        "ready": readiness.is_ready(),
+        "status": if poisoned { "degraded" } else { "healthy" },
+        "ready": readiness.is_ready() && !poisoned,
+        "poisoned": poisoned,
+        "fatal_error": fatal_err,
         "circuit_breaker": format!("{:?}", cb_state),
         "free_blocks": free_blocks,
         "total_blocks": total_blocks,
@@ -237,9 +243,14 @@ pub async fn health_handler(State(state): State<Arc<AppState>>) -> impl IntoResp
 }
 
 pub async fn ready_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let readiness = state.readiness();
+    let mut readiness = state.readiness();
+    let fatal_err = state.scheduler.fatal().map(|e| e.to_string());
+    let poisoned = fatal_err.is_some();
+    if poisoned {
+        readiness.distributed_topology_operational = false;
+    }
     let cb_ok = state.circuit_breaker.check_permission().is_ok();
-    let is_ready = readiness.is_ready() && cb_ok;
+    let is_ready = readiness.is_ready() && cb_ok && !poisoned;
     let status_code = if is_ready {
         StatusCode::OK
     } else {
@@ -255,6 +266,8 @@ pub async fn ready_handler(State(state): State<Arc<AppState>>) -> impl IntoRespo
         Json(serde_json::json!({
             "status": if is_ready { "ready" } else { "not_ready" },
             "ready": is_ready,
+            "poisoned": poisoned,
+            "fatal_error": fatal_err,
             "model": served_model,
             "container_alive": readiness.container_alive,
             "runtime_initialized": readiness.runtime_initialized,
@@ -337,6 +350,13 @@ pub async fn completions_handler(
     Json(req): Json<CompletionRequest>,
 ) -> Result<Json<CompletionResponse>, (StatusCode, String)> {
     state.check_auth(&headers)?;
+    if let Some(err) = state.scheduler.fatal() {
+        state.metrics.on_request_rejected();
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("inference group failed: {err}"),
+        ));
+    }
     tracing::info!(
         model = %req.model,
         max_tokens = req.max_tokens.unwrap_or(128),
@@ -373,7 +393,9 @@ pub async fn completions_handler(
         let prompt = req.prompt.clone();
         let dspark = req.dspark;
         state.metrics.on_request_admitted(0);
+        let scheduler = state.scheduler.clone();
         let task_res = tokio::task::spawn_blocking(move || {
+            let _step_guard = scheduler.enter_external_step()?;
             engine.generate_raw_with_options(&prompt, max_tokens, &stops, dspark, &sampling)
         })
         .await;
@@ -382,7 +404,12 @@ pub async fn completions_handler(
             Ok(Err(e)) => {
                 state.metrics.on_request_aborted();
                 tracing::error!(error = %e, "POST /v1/completions failed");
-                return Err((StatusCode::BAD_REQUEST, e.to_string()));
+                let status = if state.scheduler.is_poisoned() {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                return Err((status, e.to_string()));
             }
             Err(e) => {
                 state.metrics.on_request_aborted();
@@ -489,6 +516,13 @@ pub async fn chat_completions_handler(
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Response, (StatusCode, String)> {
     state.check_auth(&headers)?;
+    if let Some(err) = state.scheduler.fatal() {
+        state.metrics.on_request_rejected();
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("inference group failed: {err}"),
+        ));
+    }
     tracing::info!(
         model = %req.model,
         messages = req.messages.len(),
@@ -573,7 +607,9 @@ fn build_replay_sse_response(
         .unwrap()
         .as_secs();
     let completion_id = format!("chatcmpl-{}", Uuid::new_v4());
-    let replayed = state.ring_buffer.replay_since_for_stream(stream_id, last_id);
+    let replayed = state
+        .ring_buffer
+        .replay_since_for_stream(stream_id, last_id);
     let sse_stream = stream! {
         for tok in replayed {
             let chunk = ChatCompletionChunk {
@@ -600,8 +636,7 @@ fn build_replay_sse_response(
     };
     let resp = Sse::new(sse_stream)
         .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(state.config.server.sse_keepalive_secs)),
+            KeepAlive::new().interval(Duration::from_secs(state.config.server.sse_keepalive_secs)),
         )
         .into_response();
     attach_stream_id_header(resp, stream_id)
@@ -633,10 +668,7 @@ async fn execute_v41_chat(
         if let Some(last_id) = last_event_id {
             if state.ring_buffer.has_stream(stream_id) {
                 return Ok(build_replay_sse_response(
-                    state,
-                    stream_id,
-                    last_id,
-                    req.model,
+                    state, stream_id, last_id, req.model,
                 ));
             }
         }
@@ -707,16 +739,11 @@ async fn execute_v41_chat(
     let dspark = req.dspark;
 
     state.metrics.on_request_admitted(0);
+    let scheduler = state.scheduler.clone();
     let task_res = tokio::task::spawn_blocking(move || {
+        let _step_guard = scheduler.enter_external_step()?;
         engine.generate_chat_with_options(
-            &messages,
-            &tools,
-            mode,
-            effort,
-            max_tokens,
-            &stops,
-            dspark,
-            &sampling,
+            &messages, &tools, mode, effort, max_tokens, &stops, dspark, &sampling,
         )
     })
     .await;
@@ -725,7 +752,12 @@ async fn execute_v41_chat(
         Ok(Err(e)) => {
             state.metrics.on_request_aborted();
             tracing::error!(error = %e, "POST /v1/chat/completions failed");
-            return Err((StatusCode::BAD_REQUEST, e.to_string()));
+            let status = if state.scheduler.is_poisoned() {
+                StatusCode::SERVICE_UNAVAILABLE
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            return Err((status, e.to_string()));
         }
         Err(e) => {
             state.metrics.on_request_aborted();
@@ -958,10 +990,7 @@ async fn execute_host_development_chat(
         if let Some(last_id) = last_event_id {
             if state.ring_buffer.has_stream(stream_id) {
                 return Ok(build_replay_sse_response(
-                    state,
-                    stream_id,
-                    last_id,
-                    req.model,
+                    state, stream_id, last_id, req.model,
                 ));
             }
         }
@@ -999,10 +1028,16 @@ async fn execute_host_development_chat(
 
     let rx = state.scheduler.subscribe(seq_id);
 
-    state
-        .scheduler
-        .submit_sequence(sequence)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    if let Err(e) = state.scheduler.submit_sequence(sequence) {
+        state.scheduler.cancel_sequence(seq_id);
+        state.metrics.on_request_rejected();
+        let status = if state.scheduler.is_poisoned() {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::INTERNAL_SERVER_ERROR
+        };
+        return Err((status, e.to_string()));
+    }
 
     state.metrics.on_request_admitted(prompt_len);
     let _ = lifecycle.transition(crate::admission::AdmissionState::Admitted);

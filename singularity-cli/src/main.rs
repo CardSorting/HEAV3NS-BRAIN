@@ -398,7 +398,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let addr: SocketAddr = format!("{host}:{port}").parse()?;
             let listener = tokio::net::TcpListener::bind(addr).await?;
             info!("SINGULARITY bound HTTP listener on http://{addr}");
-            let serve_handle = tokio::spawn(async move { axum::serve(listener, app).await });
+            let serve_handle = tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(shutdown_signal())
+                    .await
+            });
 
             if let Some(cfg_path) = v41_config {
                 let m_path =
@@ -583,4 +587,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        if let Ok(mut sigterm) =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        {
+            sigterm.recv().await;
+        } else {
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            info!("Received SIGINT; initiating graceful HTTP server shutdown...");
+        }
+        _ = terminate => {
+            info!("Received SIGTERM; initiating graceful HTTP server shutdown...");
+        }
+    }
 }

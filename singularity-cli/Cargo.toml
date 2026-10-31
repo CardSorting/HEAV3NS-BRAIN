@@ -19,7 +19,6 @@ singularity-cuda = { workspace = true }
 singularity-cache = { workspace = true }
 singularity-scheduler = { workspace = true }
 singularity-model = { workspace = true }
-singularity-grammar = { workspace = true }
 singularity-server = { workspace = true }
 axum = { workspace = true }
 clap = { workspace = true }

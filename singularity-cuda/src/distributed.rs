@@ -417,7 +417,6 @@ mod tests {
         assert!(plan.route_engram_row(384_016_682).is_err());
     }
 
-
     #[test]
     fn rejects_non_blackwell_or_excessive_kv_budget() {
         let bad_sm = B200ClusterSpec {

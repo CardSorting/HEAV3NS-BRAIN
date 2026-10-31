@@ -62,3 +62,29 @@ jobs:
         env:
           RUSTDOCFLAGS: "-D warnings"
 
+  python-modal:
+    name: Python Modal & Scripts Suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test and lint dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install fastapi httpx ruff
+
+      - name: Lint Python (ruff)
+        run: ruff check deploy/modal scripts
+
+      - name: Run Modal lifecycle, policy, and gateway tests
+        run: python -W ignore -m unittest discover -s deploy/modal -p "test_*.py" -v
+
+      - name: Run scripts unit tests
+        run: python -W ignore -m unittest discover -s scripts -p "test_*.py" -v
+
+

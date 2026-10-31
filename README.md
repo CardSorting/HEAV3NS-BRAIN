@@ -83,6 +83,7 @@ The rebellion is not against any single company. It is against the proposition t
 | 🚀 | [Quick Start](#-quick-start) |
 | ✅ | [Test Coverage](#-test-coverage) |
 | 🗺️ | [Roadmap](#️-roadmap) |
+| 📋 | [Changelog Summary](#-changelog-summary) |
 | 🤝 | [Open Source — Why & How](#-open-source--why--how) |
 | 📊 | [For Stakeholders](#-for-stakeholders) |
 | ⚖️ | [Disclaimer](#-disclaimer) |
@@ -677,6 +678,9 @@ $$\mathcal{S}_{\text{ORE}} = \text{clamp}\!\Big( 0.40 \cdot R_{\text{completion}
 All architectural decisions, operational runbooks, live incident post-mortems, and the self-adjusting auto-rolling roadmap live in [`knowledge-base/`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/README.md):
 
 - **Core Treatises & Governance**:
+  - [Scale-to-Zero Commission & Hardening Report (`docs/SCALE_TO_ZERO_REPORT.md`)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/docs/SCALE_TO_ZERO_REPORT.md)
+  - [Agent & Developer Execution Guide (`AGENTS.md`)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/AGENTS.md)
+  - [Workspace Makefile (`Makefile`)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/Makefile)
   - [Knowledge Base Index & ORE Charter (`knowledge-base/README.md`)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/README.md)
   - [Optimal Runtime Experience Treatise & Mathematical Model (`knowledge-base/OPTIMAL_RUNTIME_EXPERIENCE.md`)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/OPTIMAL_RUNTIME_EXPERIENCE.md)
   - [Auto-Rolling Performance, Benchmark & Stability Roadmap (`knowledge-base/AUTO_ROLLING_ROADMAP.md`)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/AUTO_ROLLING_ROADMAP.md)
@@ -686,35 +690,40 @@ All architectural decisions, operational runbooks, live incident post-mortems, a
   - [ADR-003: Modal Shallow-Mount Import Resolution & Connection-Pooled ASGI Proxy](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/adrs/ADR-003-modal-container-import-and-asgi-proxy.md)
   - [ADR-004: ZOS, LCFS, FlashMLA-4, and DSpark Runtime Integration Triad](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/adrs/ADR-004-zos-lcfs-flashmla-runtime-triad.md)
   - [ADR-005: Optimal Runtime Experience (ORE) Composite SLO Model](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/adrs/ADR-005-optimal-runtime-experience-slo-model.md)
+  - [ADR-006: True Scale-to-Zero Container Lifecycle, Deploy-Time Policy Snapshot & Cost-Governance State Machine](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/adrs/ADR-006-scale-to-zero-lifecycle-and-cost-governance.md)
+  - [ADR-007: Distributed Rank-Health Monitoring, Bounded Collectives, External Step Guards & Poison Isolation](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/adrs/ADR-007-distributed-rank-health-and-poison-isolation.md)
 - **Operational Playbooks (`knowledge-base/playbooks/`)**:
   - [PLAYBOOK-001: Modal 8× NVIDIA B200 Deployment & Lossless CSF Hydration](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/playbooks/PLAYBOOK-001-modal-8xb200-deployment-and-hydration.md)
   - [PLAYBOOK-002: Startup Hang, Gateway Timeout (HTTP 499/502) & Latency Triage](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/playbooks/PLAYBOOK-002-startup-hang-and-latency-triage.md)
   - [PLAYBOOK-003: Controlled Benchmarking & ORE Calibration](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/playbooks/PLAYBOOK-003-benchmarking-and-ore-calibration.md)
-  - [PLAYBOOK-004: 8× NVIDIA B200 Cost Governance & Container Lifecycle Management](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/playbooks/PLAYBOOK-004-cost-governance-and-container-lifecycle.md)
+  - [PLAYBOOK-004: 8× NVIDIA B200 Cost Governance, Scale-to-Zero & Container Lifecycle Management](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/playbooks/PLAYBOOK-004-cost-governance-and-container-lifecycle.md)
 - **Incident Post-Mortems (`knowledge-base/post-mortems/`)**:
   - [PM-001: Modal Container Shallow-Mount Import Crashloop (`IndexError: 2`)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/post-mortems/PM-001-modal-shallow-mount-import-crashloop.md)
   - [PM-002: 20-Minute Startup Stall & 600s+ `POST /v1/chat/completions` Hang (HTTP 499)](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/post-mortems/PM-002-startup-revalidation-and-cpu-reference-hang.md)
   - [PM-003: `KeyError: 'shard_count'` in `SingularityV41Service.startup()`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/post-mortems/PM-003-validate-checkpoint-schema-keyerror.md)
+  - [PM-004: Deploy-Time Scaling Policy Environment Drift in Modal Containers](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/post-mortems/PM-004-deploy-time-policy-env-drift-in-container.md)
+  - [PM-005: False SSE Stream Abandonment & Missing Token Accounting on Client Disconnect After `data: [DONE]`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/post-mortems/PM-005-sse-done-premature-client-disconnect-accounting.md)
 
 ---
 
 ## ✅ Test Coverage
 
-135+ automated tests across 9 Rust crates and the Modal deployment suite. Zero warnings. Zero failures.
+215+ automated tests across 9 Rust crates, the Modal scale-to-zero deployment suite (`71` tests), and script utilities (`11` tests). Zero warnings. Zero failures.
 
 | Suite | Crate / Module | Tests | Verified |
 |---|---|:---:|---|
 | GPU backend & cluster | `singularity-cuda` | 10 | Allocation · OOM rejection · hardware fallback · DMA · 8× B200 cluster budget · V4.1 layout |
-| KV cache | `singularity-cache` | 4 | Bitset allocation · double-free protection · radix matching · pinned node protection |
+| KV cache | `singularity-cache` | 4 | Bitset allocation · double-free protection · unallocated pin rejection · radix matching · pinned node protection |
 | Core & ORE metrics | `singularity-core` | 5 | Sequence lifecycle · linear-interpolated TTFT/ITL percentiles · `compute_optimal_runtime_score` SLO parity |
 | Grammar | `singularity-grammar` | 3 | KMP build · tool-call trigger/stop · JSON bitmask masking |
 | Model & V4.1 CSF | `singularity-model` | 68 | V4.1 MLA · 384-expert MoE · Engram · DSpark `prefill_token_with_targets` · Lossless CSF codec |
-| Scheduler | `singularity-scheduler` | 4 | LCFS preemption · DP consensus · two-phase fallback · forward pass integration |
+| Scheduler & rank health | `singularity-scheduler` | 12 | LCFS preemption · DP consensus · bounded collectives · `RankHealthMonitor` · `ExternalStepGuard` |
 | Server & V4.1 engine | `singularity-server` | 7 | V4.1 serving engine · CSF alias routing · circuit breaker · rate governor · ring buffer |
-| E2E server | `singularity-tests` | 2 | Full HTTP bring-up · V4.1 readiness/auth · CSF alias · multi-stream SSE `Last-Event-ID` · ORE `/metrics` |
+| E2E & rank-health isolation | `singularity-tests` | 9 | Full HTTP bring-up · poisoned `/ready` & `/health` 503 degradation · hung step watchdog · partial pin rollback |
 | Failure modes | `singularity-tests` | 18 | 18 explicit edge cases: exhaustion · deadlock · backpressure · stream interruption |
 | Real inference | `singularity-tests` | 6 | SmolLM2-135M forward + decode · DeepSeek-V2-Lite MLA + MoE · multi-shard · paged KV DMA |
-| Modal 8× B200 pipeline | `deploy/modal` | 8 | CSF codec reconstruction · shallow-mount imports · pooled ASGI proxy · ORE benchmark math |
+| Modal scale-to-zero & gateway | `deploy/modal` | 71 | Scale-to-zero policy · `LifecycleTracker` & `LifecycleWatchdog` · SSE `[DONE]` & token accounting · orphan audit |
+| Script utilities | `scripts` | 11 | CSF converter & shard verification tests |
 
 ---
 
@@ -729,15 +738,31 @@ All architectural decisions, operational runbooks, live incident post-mortems, a
 - [x] Live 8× NVIDIA B200 deployment on Modal (`im-R1TdH6JxBrlEvExHAIqaph`) with 48 hydrated CSF shards (`495.63 GB`)
 - [x] Resolved `PM-001` (shallow-mount imports), `PM-002` (single-pass startup + bounded slice), and `PM-003` (15-key validation schema)
 - [x] Optimal Runtime Experience (ORE) inner-loop optimizations (DSpark prefill head-elision, shared MoE/Attention FP8 activation quantization, stack-allocated FP8/FP4/sparse-softmax block buffers, $O(N)$ partial selection, pooled ASGI proxy, isolated V4.1 SSE `StreamRingBuffer` replay, and unified $\mathcal{S}_{\text{ORE}}$ telemetry)
-- [x] Working knowledge base (`knowledge-base/`) with ADRs, Playbooks, Post-Mortems, and Auto-Rolling Roadmap
+- [x] Working knowledge base (`knowledge-base/`) with ADRs (`ADR-001`..`ADR-007`), Playbooks (`PLAYBOOK-001`..`PLAYBOOK-004`), Post-Mortems (`PM-001`..`PM-005`), and Auto-Rolling Roadmap
+- [x] True scale-to-zero container lifecycle (`ADR-006`), deploy-time policy snapshot (`PM-004`), SSE `[DONE]` & token accounting (`PM-005`), distributed rank-health poison isolation & `ExternalStepGuard` (`ADR-007`), and unified `Makefile` / `AGENTS.md` / CI gates (`BASE-06`..`BASE-08`)
 
 ### 🔄 Horizon 0 & Horizon 1 — Active Rolling Sprints
 
 - [ ] **H0-01**: Adaptive admission control modulating `TokenBucketRateGovernor` directly from live `itl_jitter_ratio`
 - [ ] **H0-02**: Parallel multi-threaded 48-shard header verification (`< 1.5s` cold-volume check)
+- [ ] **H0-03**: Automated benchmark regression diffing in `deploy.py benchmark`
+- [ ] **H0-04**: Live 8× NVIDIA B200 (`B200:8`) full-model scale-to-zero cold-start, TTFT/TPOT, and lifetime-guard verification (pending cluster capacity & spend approval)
 - [ ] **H1-01**: In-kernel GPU CSF scale decompression (`tcgen05.mma` prologue in SMEM)
 - [ ] **H1-02**: FlashMLA-4 Split-KV persistent megakernel decode on SM100
 - [ ] **H1-03**: Fused MoE router + NVLink 5 (`1.8 TB/s`) all-to-all dispatch across `EP=8`
+- [ ] **H1-04**: Multi-process NCCL transport & remote rank heartbeat producer wired into `RankHealthMonitor`
+
+---
+
+## 📋 Changelog Summary
+
+> Full release history and item-by-item diffs are maintained in **[`CHANGELOG.md`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/CHANGELOG.md)**.
+
+| Version | Date | Milestone Summary | Key Highlights |
+| :--- | :---: | :--- | :--- |
+| **[`v0.3.0`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/CHANGELOG.md)** | `2026-10-31` | **True Scale-to-Zero Lifecycle, Distributed Rank-Health Isolation & Pass 1–6 Hardening** | `min_containers=0` default with `SINGULARITY_ALLOW_PINNED_WARM=1` guard · `policy_env_snapshot()` deploy-time image baking (`PM-004`) · 6-state `LifecycleTracker` & `LifecycleWatchdog` self-exit (`SIGINT` $\rightarrow$ exit `70`) · SSE `[DONE]` disconnect & `tokens_out` accounting (`PM-005`) · `RankHealthMonitor`, wait-bounded DP collectives, `ExternalStepGuard` & `HTTP 503` poison isolation (`ADR-007`) · `PagedBlockManager::pin_block` unallocated rejection & partial-pin rollback · 22 unused Rust deps pruned · `Makefile`, `AGENTS.md` & CI `python-modal` gate |
+| **[`v0.2.0`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/CHANGELOG.md)** | `2026-10-31` | **DeepSeek-V4.1-Flash-1017 Lossless CSF, 8× NVIDIA B200 Deployment & Optimal Runtime Experience (ORE)** | Native `lil-mxfp4-csf-checkpoint/1` zero-copy scale reconstruction across 48 shards (`495.63 GB`, `ADR-001`) · Resolved `PM-001` (shallow-mount imports), `PM-002` (single-pass startup + bounded slice) & `PM-003` (15-key validation schema) · ORE inner-loop optimizations (DSpark prefill head-elision, shared MoE/Attention FP8 quantization, stack block buffers, $O(N)$ partial selection, pooled ASGI proxy, isolated SSE `Last-Event-ID` replay) · `knowledge-base/` treatise, ADRs, playbooks & auto-rolling roadmap |
+| **[`v0.1.0`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/CHANGELOG.md)** | `2026-10-30` | **Initial 9-Crate Rust Inference Engine Release** | `singularity-core`, `singularity-cuda` (SM100/SM90 + `MockGpuBackend`), `singularity-cache` (`PagedBlockManager` + `RadixTree`), `singularity-scheduler` (`ZosScheduler` + LCFS + DP consensus), `singularity-model` (Safetensors mmap + FlashMLA + MoE), `singularity-grammar` (KMP + JSON Schema bitmask), `singularity-server` (Axum OpenAI HTTP/SSE + `CircuitBreaker` + `LeakyTokenBucket`), `singularity-cli` & `singularity-tests` |
 
 ---
 

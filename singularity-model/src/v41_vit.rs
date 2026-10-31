@@ -1,15 +1,11 @@
 //! CPU reference for the checkpoint's bidirectional vision transformer.
 //! Uses BF16 boundaries and FP32 accumulation; not an optimized GPU backend.
+use crate::model_error as error;
 use crate::{
     v41_block::RmsNorm, v41_compressor::Bf16Matrix, v41_config::VisionConfig, SafetensorsMmapLoader,
 };
 use half::bf16;
 use singularity_core::SingularityError;
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
 fn bf(x: f32) -> f32 {
     bf16::from_f32(x).to_f32()
 }

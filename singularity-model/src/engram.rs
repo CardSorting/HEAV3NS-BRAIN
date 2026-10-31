@@ -6,11 +6,7 @@
 use singularity_core::SingularityError;
 use std::collections::HashSet;
 
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
+use crate::model_error as error;
 
 #[derive(Debug, Clone)]
 pub struct EngramLayerLayout {

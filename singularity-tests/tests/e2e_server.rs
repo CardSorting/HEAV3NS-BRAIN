@@ -518,4 +518,3 @@ async fn test_e2e_v41_serving_readiness_and_auth() {
     assert!(metrics_json["completion_success_rate"].as_f64().unwrap() >= 0.99);
     assert!(metrics_json["optimal_runtime_score"].as_f64().unwrap() > 0.0);
 }
-

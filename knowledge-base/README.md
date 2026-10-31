@@ -18,16 +18,20 @@ knowledge-base/
 │   ├── ADR-002-single-pass-startup-and-bounded-slice.md   # Single-pass startup validation & bounded resident serving slice
 │   ├── ADR-003-modal-container-import-and-asgi-proxy.md   # Shallow-mount import resolution & pooled ASGI streaming proxy
 │   ├── ADR-004-zos-lcfs-flashmla-runtime-triad.md         # ZOS, LCFS, FlashMLA-4, and DSpark runtime integration
-│   └── ADR-005-optimal-runtime-experience-slo-model.md    # Formal ORE composite balance metric & admission control loop
+│   ├── ADR-005-optimal-runtime-experience-slo-model.md    # Formal ORE composite balance metric & admission control loop
+│   ├── ADR-006-scale-to-zero-lifecycle-and-cost-governance.md # Scale-to-zero policy, LifecycleTracker/Watchdog, SSE [DONE] accounting
+│   └── ADR-007-distributed-rank-health-and-poison-isolation.md # RankHealthMonitor, bounded collectives, ExternalStepGuard & 503 poison isolation
 ├── playbooks/                                             # Operational runbooks for deployment, triage, benchmarking & cost
 │   ├── PLAYBOOK-001-modal-8xb200-deployment-and-hydration.md
 │   ├── PLAYBOOK-002-startup-hang-and-latency-triage.md
 │   ├── PLAYBOOK-003-benchmarking-and-ore-calibration.md
 │   └── PLAYBOOK-004-cost-governance-and-container-lifecycle.md
-└── post-mortems/                                          # Blameless root-cause analyses of live 8× B200 incidents
+└── post-mortems/                                          # Blameless root-cause analyses of live cloud & runtime incidents
     ├── PM-001-modal-shallow-mount-import-crashloop.md
     ├── PM-002-startup-revalidation-and-cpu-reference-hang.md
-    └── PM-003-validate-checkpoint-schema-keyerror.md
+    ├── PM-003-validate-checkpoint-schema-keyerror.md
+    ├── PM-004-deploy-time-policy-env-drift-in-container.md
+    └── PM-005-sse-done-premature-client-disconnect-accounting.md
 ```
 
 ---

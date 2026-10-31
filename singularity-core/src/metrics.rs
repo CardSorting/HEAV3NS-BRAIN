@@ -75,22 +75,22 @@ impl MetricsCollector {
     }
 
     pub fn on_request_completed(&self, generated_tokens: usize) {
-        let _ = self.active_requests.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| Some(cur.saturating_sub(1)),
-        );
+        let _ = self
+            .active_requests
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(1))
+            });
         self.completed_requests.fetch_add(1, Ordering::Relaxed);
         self.total_generated_tokens
             .fetch_add(generated_tokens as u64, Ordering::Relaxed);
     }
 
     pub fn on_request_aborted(&self) {
-        let _ = self.active_requests.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |cur| Some(cur.saturating_sub(1)),
-        );
+        let _ = self
+            .active_requests
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
+                Some(cur.saturating_sub(1))
+            });
         self.aborted_requests.fetch_add(1, Ordering::Relaxed);
     }
 

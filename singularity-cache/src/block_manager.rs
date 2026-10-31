@@ -255,6 +255,11 @@ impl PagedBlockManager {
                 detail: format!("Invalid block_id {block_id} out of range"),
             });
         }
+        if !self.is_block_allocated(block_id) {
+            return Err(SingularityError::CacheError {
+                detail: format!("Cannot pin unallocated block_id {block_id}"),
+            });
+        }
         let mut block = self.blocks[block_id].lock();
         block.ref_count += 1;
         block.is_pinned = true;

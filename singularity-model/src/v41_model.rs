@@ -1,4 +1,5 @@
 //! Single-sequence V4.1 CPU reference runner (text and multimodal). Not a production GPU backend.
+use crate::model_error as error;
 use crate::{
     engram::Flash1017HashState,
     v41_attention::LoadedWindowAttention,
@@ -17,11 +18,6 @@ use crate::{
 };
 use singularity_core::SingularityError;
 use std::sync::Arc;
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
 
 #[allow(clippy::large_enum_variant)]
 enum Attention<'a> {

@@ -11,9 +11,9 @@ pub struct LcfsSchedulerResult {
 
 /// LCFS (Last-Come-First-Served) Decode Prioritization Engine.
 /// Matches the verified code reality of DeepInfer (csrc/engine/scheduler.hpp#L622-L646):
-/// 1. Sorts running sequences descending by output length: running[0] has longest output, running[N-1] shortest.
+/// 1. Sorts running sequences descending by output length: `running[0]` has the longest output, `running[N-1]` the shortest.
 /// 2. Iterates from r-1 (shortest output first) to schedule newest requests.
-/// 3. If KV cache block allocation fails, preempts running[l] (l=0, longest running request).
+/// 3. If KV cache block allocation fails, preempts `running[l]` (`l = 0`, the longest running request).
 pub fn schedule_decode_lcfs(
     mut running: Vec<Sequence>,
     max_batch_size: usize,

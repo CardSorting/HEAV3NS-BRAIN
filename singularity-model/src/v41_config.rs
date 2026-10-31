@@ -260,11 +260,12 @@ impl V41Config {
     ) -> Result<CheckpointInventorySummary, SingularityError> {
         self.validate()?;
         let mut count = 0usize;
-        let mut require = |name: &str, expected_dtype: &'static str| -> Result<(), SingularityError> {
-            visitor(name, expected_dtype)?;
-            count += 1;
-            Ok(())
-        };
+        let mut require =
+            |name: &str, expected_dtype: &'static str| -> Result<(), SingularityError> {
+                visitor(name, expected_dtype)?;
+                count += 1;
+                Ok(())
+            };
 
         require("embed.weight", "BF16")?;
         require("head.weight", "BF16")?;
@@ -625,4 +626,3 @@ mod tests {
         assert!(cfg.validate_checkpoint_inventory(&bad_loader).is_err());
     }
 }
-

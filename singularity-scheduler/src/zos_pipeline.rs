@@ -9,8 +9,23 @@ use singularity_core::{SchedulerConfig, Sequence, SequenceId, SequenceStatus, Si
 use singularity_cuda::{GpuBackend, GpuEvent, GpuStream};
 use singularity_model::{KvCache, Sampler, TransformerConfig, TransformerModel};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use crate::rank_health::{run_collective_with_deadline, CollectiveError, RankHealthMonitor};
+
+/// Wait bound for a DP collective when no monitor/deadline was configured.
+const DEFAULT_COLLECTIVE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// The data-parallel all-reduce (NCCL boundary): `(vote, op) -> reduced`.
+pub type DpReduceFn = Arc<dyn Fn(i32, &str) -> i32 + Send + Sync>;
+
+struct HealthWiring {
+    monitor: Arc<RankHealthMonitor>,
+    local_rank: usize,
+    deadline: Duration,
+}
 
 pub struct DeferredRelease {
     pub unpin_blocks: Vec<usize>,
@@ -87,6 +102,39 @@ pub struct ZosScheduler {
 
     listeners: Mutex<HashMap<SequenceId, tokio::sync::mpsc::UnboundedSender<SequenceOutputEvent>>>,
     step_lock: Mutex<()>,
+
+    health: Option<HealthWiring>,
+    dp_reduce: Option<DpReduceFn>,
+    /// Sticky: once set the group is considered dead and never retried.
+    fatal: Mutex<Option<CollectiveError>>,
+    /// Count of active steps (`step()` or `enter_external_step()`); the watchdog measures stalls only when > 0.
+    in_step: AtomicUsize,
+}
+
+struct StepGuard<'a>(&'a AtomicUsize);
+
+impl Drop for StepGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// RAII guard for external synchronous forward passes (e.g. V4.1 engine execution in
+/// `spawn_blocking`) so `RankHealthMonitor` and `watchdog_tick()` cover stalls outside
+/// `ZosScheduler::step()`.
+pub struct ExternalStepGuard<'a> {
+    scheduler: &'a ZosScheduler,
+}
+
+impl Drop for ExternalStepGuard<'_> {
+    fn drop(&mut self) {
+        self.scheduler.in_step.fetch_sub(1, Ordering::SeqCst);
+        if !self.scheduler.is_poisoned() {
+            if let Some(h) = &self.scheduler.health {
+                h.monitor.report_progress(h.local_rank, Instant::now());
+            }
+        }
+    }
 }
 
 impl ZosScheduler {
@@ -140,6 +188,10 @@ impl ZosScheduler {
             deferred_release: Mutex::new(DeferredRelease::new()),
             listeners: Mutex::new(HashMap::new()),
             step_lock: Mutex::new(()),
+            health: None,
+            dp_reduce: None,
+            fatal: Mutex::new(None),
+            in_step: AtomicUsize::new(0),
         })
     }
 
@@ -165,22 +217,168 @@ impl ZosScheduler {
             let out = self.step()?;
             Ok(Some(out))
         } else {
+            // Idle: no collective is expected, so stall time must not accrue.
+            if let Some(h) = &self.health {
+                h.monitor.report_all_progress(Instant::now());
+            }
+            // Still surface a sticky failure instead of reporting a healthy idle.
+            self.ensure_healthy()?;
             Ok(None)
         }
     }
 
+    /// True once a rank failure / collective timeout has poisoned this scheduler.
+    pub fn is_poisoned(&self) -> bool {
+        self.fatal.lock().is_some()
+    }
+
+    /// The group's fatal error, if any.
+    pub fn fatal(&self) -> Option<CollectiveError> {
+        self.fatal.lock().clone()
+    }
+
+    /// Called from an independent watchdog thread. If a rank failed explicitly, or a step
+    /// has been running longer than the stall timeout (a hung rank/collective that the
+    /// stuck stepping thread can never report itself), poison the scheduler: all
+    /// subscribers get `Cancelled`, resources are released, new work is refused.
+    /// Returns the fatal error once poisoned. Cheap when idle.
+    pub fn watchdog_tick(&self) -> Option<CollectiveError> {
+        if let Some(h) = &self.health {
+            // Explicit failures count at any time; stalls only while a step is running.
+            if self.in_step.load(Ordering::SeqCst) > 0 {
+                if let Err(e) = h.monitor.check(Instant::now()) {
+                    self.poison(e);
+                }
+            } else if let Err(e @ CollectiveError::RankFailed(_)) = h.monitor.check(Instant::now())
+            {
+                self.poison(e);
+            }
+        }
+        self.fatal()
+    }
+
+    /// Enter a tracked external step (such as a synchronous V4.1 forward pass).
+    /// Fails fast if the scheduler is already poisoned; otherwise marks the scheduler
+    /// in-step so `watchdog_tick()` can detect stalls during the external execution.
+    pub fn enter_external_step(&self) -> Result<ExternalStepGuard<'_>, SingularityError> {
+        self.ensure_healthy()?;
+        if self.in_step.fetch_add(1, Ordering::SeqCst) == 0 {
+            if let Some(h) = &self.health {
+                h.monitor.report_all_progress(Instant::now());
+            }
+        }
+        if let Some(e) = self.fatal.lock().clone() {
+            self.in_step.fetch_sub(1, Ordering::SeqCst);
+            return Err(Self::fatal_error(&e));
+        }
+        Ok(ExternalStepGuard { scheduler: self })
+    }
+
+    /// Attach a rank-health monitor. `local_rank` is this process's rank; the monitor is
+    /// shared with whatever reports remote-rank heartbeats/failures.
+    pub fn with_rank_health(
+        mut self,
+        monitor: Arc<RankHealthMonitor>,
+        local_rank: usize,
+        collective_deadline: Duration,
+    ) -> Self {
+        self.health = Some(HealthWiring {
+            monitor,
+            local_rank,
+            deadline: collective_deadline,
+        });
+        self
+    }
+
+    /// Install the data-parallel all-reduce (the NCCL boundary). Every call is wait-bounded
+    /// by the collective deadline (default 30 s if no monitor is attached).
+    pub fn with_dp_reduce(mut self, f: DpReduceFn) -> Self {
+        self.dp_reduce = Some(f);
+        self
+    }
+
+    fn collective_deadline(&self) -> Duration {
+        self.health
+            .as_ref()
+            .map(|h| h.deadline)
+            .unwrap_or(DEFAULT_COLLECTIVE_DEADLINE)
+    }
+
+    fn fatal_error(e: &CollectiveError) -> SingularityError {
+        SingularityError::HardwareError {
+            detail: format!("distributed group failed (fatal, do not retry): {e}"),
+        }
+    }
+
+    fn ensure_healthy(&self) -> Result<(), SingularityError> {
+        if let Some(e) = self.fatal.lock().clone() {
+            return Err(Self::fatal_error(&e));
+        }
+        if let Some(h) = &self.health {
+            if let Err(e) = h.monitor.check(Instant::now()) {
+                return Err(self.poison(e));
+            }
+        }
+        Ok(())
+    }
+
+    /// Mark the group failed (sticky) and isolate: cancel every subscriber, free every
+    /// queued/running sequence's blocks and KV caches, so no client waits on a dead group
+    /// and no resources stay pinned. Idempotent.
+    pub fn poison_with(&self, e: CollectiveError) -> SingularityError {
+        self.poison(e)
+    }
+
+    fn poison(&self, e: CollectiveError) -> SingularityError {
+        let err = Self::fatal_error(&e);
+        {
+            let mut f = self.fatal.lock();
+            if f.is_some() {
+                return err;
+            }
+            *f = Some(e);
+        }
+        tracing::error!("{err}");
+        for (_, tx) in self.listeners.lock().drain() {
+            let _ = tx.send(SequenceOutputEvent::Cancelled);
+        }
+        self.kv_caches.lock().clear();
+        let mut doomed: Vec<Sequence> = Vec::new();
+        doomed.extend(self.waiting_queue.lock().drain(..));
+        doomed.extend(self.running_sequences.lock().drain(..));
+        doomed.extend(self.preempted_queue.lock().drain(..));
+        for seq in doomed {
+            let _ = self.block_manager.free_blocks(&seq.allocated_block_ids);
+        }
+        err
+    }
+
     pub fn submit_sequence(&self, mut seq: Sequence) -> Result<(), SingularityError> {
+        self.ensure_healthy()?;
         // Check Radix prefix cache for prompt prefix reuse
         let (matched_blocks, matched_tokens) = self.radix_tree.match_prefix(&seq.prompt_tokens);
         if matched_tokens > 0 {
-            for &bid in &matched_blocks {
-                self.block_manager.pin_block(bid)?;
+            for (i, &bid) in matched_blocks.iter().enumerate() {
+                if let Err(e) = self.block_manager.pin_block(bid) {
+                    for &pinned_id in &matched_blocks[..i] {
+                        let _ = self.block_manager.unpin_block(pinned_id);
+                    }
+                    return Err(e);
+                }
             }
             seq.allocated_block_ids = matched_blocks;
             seq.num_cached_tokens = matched_tokens;
         }
 
-        self.waiting_queue.lock().push_back(seq);
+        let mut waiting = self.waiting_queue.lock();
+        if let Some(e) = self.fatal.lock().clone() {
+            drop(waiting);
+            for &pinned_id in &seq.allocated_block_ids {
+                let _ = self.block_manager.unpin_block(pinned_id);
+            }
+            return Err(Self::fatal_error(&e));
+        }
+        waiting.push_back(seq);
         Ok(())
     }
 
@@ -225,6 +423,14 @@ impl ZosScheduler {
     /// Coordinates DP consensus, prefill / decode scheduling, LCFS preemption,
     /// mock/GPU stream execution, and deferred resource cleanup.
     pub fn step(&self) -> Result<StepOutput, SingularityError> {
+        self.ensure_healthy()?;
+        // Stall time is measured per step: refresh every live rank, then mark in-step.
+        if self.in_step.fetch_add(1, Ordering::SeqCst) == 0 {
+            if let Some(h) = &self.health {
+                h.monitor.report_all_progress(Instant::now());
+            }
+        }
+        let _in_step = StepGuard(&self.in_step);
         let step_start = Instant::now();
 
         // 1. Pre-Sampler Sync & Deferred Resource Release from Step N-1
@@ -238,9 +444,28 @@ impl ZosScheduler {
         // 2. DP Consensus Voting: Prefill vs Decode
         let has_waiting =
             !self.waiting_queue.lock().is_empty() || !self.preempted_queue.lock().is_empty();
-        let step_type = {
-            let mut dp = self.dp_consensus.lock();
-            dp.decide_step_type(has_waiting, |val, _op| val) // In single-node/standalone, local vote is unanimous
+        let step_type = match self.dp_reduce.clone() {
+            // Single-node/standalone: the local vote is unanimous.
+            None => self
+                .dp_consensus
+                .lock()
+                .decide_step_type(has_waiting, |val, _op| val),
+            // Multi-rank: every reduce is wait-bounded; a timeout/failure is fatal for the group.
+            Some(f) => {
+                let deadline = self.collective_deadline();
+                let res =
+                    self.dp_consensus
+                        .lock()
+                        .decide_step_type_checked(has_waiting, |val, op| {
+                            let f = f.clone();
+                            let op = op.to_string();
+                            run_collective_with_deadline(deadline, move || f(val, &op))
+                        });
+                match res {
+                    Ok(s) => s,
+                    Err(e) => return Err(self.poison(e)),
+                }
+            }
         };
 
         let mut newly_finished = Vec::new();
@@ -329,10 +554,27 @@ impl ZosScheduler {
                 if scheduled_prefill.is_empty() {
                     // Two-phase consensus: 0 tokens scheduled in prefill step.
                     // If running sequences exist, switch to Decode immediately to avoid starvation/infinite prefill spin loops.
-                    let fallback_step = self
-                        .dp_consensus
-                        .lock()
-                        .validate_two_phase(0, |val, _op| val);
+                    let fallback_step = match self.dp_reduce.clone() {
+                        None => self
+                            .dp_consensus
+                            .lock()
+                            .validate_two_phase(0, |val, _op| val),
+                        Some(f) => {
+                            let deadline = self.collective_deadline();
+                            let res = self.dp_consensus.lock().validate_two_phase_checked(
+                                0,
+                                |val, op| {
+                                    let f = f.clone();
+                                    let op = op.to_string();
+                                    run_collective_with_deadline(deadline, move || f(val, &op))
+                                },
+                            );
+                            match res {
+                                Ok(s) => s,
+                                Err(e) => return Err(self.poison(e)),
+                            }
+                        }
+                    };
                     if fallback_step == StepType::Decode
                         && !self.running_sequences.lock().is_empty()
                     {
@@ -448,6 +690,10 @@ impl ZosScheduler {
                     let _ = tx.send(SequenceOutputEvent::Finished(Box::new(fin.clone())));
                 }
             }
+        }
+
+        if let Some(h) = &self.health {
+            h.monitor.report_progress(h.local_rank, Instant::now());
         }
 
         Ok(StepOutput {
@@ -576,6 +822,10 @@ impl ZosScheduler {
 
     pub fn preempted_count(&self) -> usize {
         self.preempted_queue.lock().len()
+    }
+
+    pub fn listener_count(&self) -> usize {
+        self.listeners.lock().len()
     }
 }
 

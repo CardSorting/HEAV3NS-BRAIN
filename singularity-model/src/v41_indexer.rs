@@ -1,5 +1,6 @@
 //! Single-token CPU indexer reference for compressed V4.1 attention.
 //! Shared index keys and candidate masks are owned by the caller.
+use crate::model_error as error;
 use crate::{
     v41_block::RmsNorm,
     v41_compressor::Bf16Matrix,
@@ -11,11 +12,6 @@ use crate::{
 };
 use half::bf16;
 use singularity_core::SingularityError;
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
 
 pub struct Indexer<'a> {
     q: CheckpointMatrix<'a>,

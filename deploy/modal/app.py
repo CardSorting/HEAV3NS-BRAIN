@@ -7,8 +7,9 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 
 def _resolve_repo_root(file_path: Path) -> Path:
     resolved = file_path.resolve()
@@ -47,16 +48,25 @@ if __package__ in (None, ""):
         HF_SECRET_NAME,
         INTERNAL_SERVER_HOST,
         INTERNAL_SERVER_PORT,
-        MAX_CONTAINERS,
         MEMORY_MB,
-        MIN_CONTAINERS,
         REQUEST_TIMEOUT_SECS,
-        SCALEDOWN_WINDOW_SECS,
+        STARTUP_RETRY_MAX_ATTEMPTS,
         STARTUP_TIMEOUT_SECS,
         VOLUME_MOUNT_PATH,
         VOLUME_NAME,
+        policy_env_snapshot,
+        resolve_scaling_policy,
     )
     from deploy.modal.health import check_service_health, verify_gpu_topology
+    from deploy.modal.lifecycle import (
+        AdmissionRejected,
+        LifecycleState,
+        LifecycleTracker,
+        LifecycleWatchdog,
+        retry_bounded,
+        start_with_cleanup,
+    )
+    from deploy.modal.ops import gpu_snapshot
     from deploy.modal.image import build_singularity_image
     from deploy.modal.model_storage import (
         download_pinned_checkpoint,
@@ -77,16 +87,25 @@ else:
         HF_SECRET_NAME,
         INTERNAL_SERVER_HOST,
         INTERNAL_SERVER_PORT,
-        MAX_CONTAINERS,
         MEMORY_MB,
-        MIN_CONTAINERS,
         REQUEST_TIMEOUT_SECS,
-        SCALEDOWN_WINDOW_SECS,
+        STARTUP_RETRY_MAX_ATTEMPTS,
         STARTUP_TIMEOUT_SECS,
         VOLUME_MOUNT_PATH,
         VOLUME_NAME,
+        policy_env_snapshot,
+        resolve_scaling_policy,
     )
     from .health import check_service_health, verify_gpu_topology
+    from .lifecycle import (
+        AdmissionRejected,
+        LifecycleState,
+        LifecycleTracker,
+        LifecycleWatchdog,
+        retry_bounded,
+        start_with_cleanup,
+    )
+    from .ops import gpu_snapshot
     from .image import build_singularity_image
     from .model_storage import (
         download_pinned_checkpoint,
@@ -328,20 +347,37 @@ class SingularityRuntimeSupervisor:
             f"Timed out waiting {ready_timeout_secs}s for SINGULARITY /ready: {last_health}"
         )
 
+    def alive(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
     def stop(self) -> None:
+        """Idempotent; safe on partial init (process may be None or already dead)."""
         if self.process is not None and self.process.poll() is None:
             self.process.terminate()
             try:
                 self.process.wait(timeout=15)
             except subprocess.TimeoutExpired:
                 self.process.kill()
+                self.process.wait(timeout=15)
 
 
-def create_asgi_proxy_app(upstream_url: str, timeout_secs: float = REQUEST_TIMEOUT_SECS):
+def create_asgi_proxy_app(
+    upstream_url: str,
+    timeout_secs: float = REQUEST_TIMEOUT_SECS,
+    tracker: Optional[LifecycleTracker] = None,
+    gpu_sampler: Optional[object] = None,
+    liveness: Optional[object] = None,
+):
     """Create the FastAPI reverse proxy that forwards HTTP and SSE traffic to the local
     `singularity serve` child process without buffering `text/event-stream` responses.
     Uses a loop-scoped connection-pooled `httpx.AsyncClient` to eliminate per-request
     client/pool allocation and loopback TCP handshake churn under concurrent load.
+
+    With a `tracker`, every POST (generation work) is admitted/rejected by the lifecycle
+    state machine (not-ready, draining, concurrency, lifetime, spend), counted in flight
+    until the response -- including a streamed one -- fully closes, and bounded by a hard
+    per-request wall-clock deadline. `GET /__lifecycle/status` is answered locally. The
+    gateway runs NO background task: it never pings upstream on its own.
     """
     import asyncio
     from contextlib import asynccontextmanager
@@ -352,6 +388,32 @@ def create_asgi_proxy_app(upstream_url: str, timeout_secs: float = REQUEST_TIMEO
     # Ensure `from __future__ import annotations` resolves `Request` in module globals.
     globals()["Request"] = Request
     globals()["Response"] = Response
+
+    class _ReleasingStreamingResponse(StreamingResponse):
+        """StreamingResponse that explicitly closes `body_iterator` and runs `on_finish`
+        when the ASGI call ends.
+
+        Starlette cancels the body task when the client disconnects (including right after
+        reading `data: [DONE]`). Explicitly closing `body_iterator` before `on_finish`
+        guarantees deterministic cleanup order, and `on_finish` runs in normal async context
+        so `await resp.aclose()` never executes inside a `GeneratorExit` handler.
+        """
+
+        def __init__(self, *args, on_finish, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._on_finish = on_finish
+
+        async def __call__(self, scope, receive, send):
+            try:
+                await super().__call__(scope, receive, send)
+            finally:
+                aclose = getattr(self.body_iterator, "aclose", None)
+                if callable(aclose):
+                    try:
+                        await aclose()
+                    except BaseException:  # noqa: BLE001
+                        pass
+                await self._on_finish()
 
     upstream = upstream_url.rstrip("/")
     _client_holder: Dict[str, object] = {"client": None, "loop": None}
@@ -394,11 +456,89 @@ def create_asgi_proxy_app(upstream_url: str, timeout_secs: float = REQUEST_TIMEO
     proxy.state.get_upstream_client = _get_shared_client
     proxy.state.close_upstream_client = _close_shared_client
 
-    @proxy.api_route(
+    def _noop_close(*, ok: bool = True, tokens: int = 0) -> None:
+        return None
+
+    async def forward(path: str, request: Request):
+        clean = f"/{path.lstrip('/')}"
+        if tracker is not None and request.method == "GET" and clean == "/__lifecycle/status":
+            snap = tracker.snapshot()
+            if request.query_params.get("gpu") == "1" and callable(gpu_sampler):
+                snap["gpu"] = gpu_sampler()  # on-demand only; never sampled in the background
+            return Response(content=json.dumps(snap), media_type="application/json")
+        if tracker is None or request.method != "POST":
+            return await _forward_inner(path, request, _noop_close)
+
+        tracker.reap_expired()  # pull-based stuck-job reaping; no background loop
+        if callable(liveness) and not liveness():
+            # Child `singularity serve` is gone: never keep a dead GPU worker admitting work.
+            try:
+                tracker.transition(LifecycleState.FAILED)
+            except Exception:  # noqa: BLE001
+                tracker.begin_drain()
+            return Response(
+                content=json.dumps({"error": "inference worker process exited", "code": "worker_dead"}),
+                status_code=503,
+                headers={"Retry-After": "30"},
+                media_type="application/json",
+            )
+        # Server-generated key. A client-supplied x-request-id is NEVER the dedupe/accounting
+        # key (a client could collide with or squat on another request's id); it is only
+        # logged for correlation.
+        rid = uuid.uuid4().hex
+        client_rid = request.headers.get("x-request-id")
+        if client_rid:
+            print(f"[SINGULARITY proxy] request {rid} client x-request-id={client_rid[:64]!r}", flush=True)
+        try:
+            tracker.admit(rid)
+        except AdmissionRejected as rej:
+            return Response(
+                content=json.dumps({"error": rej.detail, "code": rej.code}),
+                status_code=rej.http_status,
+                headers={"Retry-After": "30"},
+                media_type="application/json",
+            )
+
+        def on_close(*, ok: bool = True, tokens: int = 0) -> None:
+            tracker.release(rid, ok=ok, tokens=tokens)
+
+        ctx: Dict[str, object] = {"tokens": 0}
+
+        async def _close_upstream() -> None:
+            up = ctx.pop("resp", None)
+            if up is not None:
+                try:
+                    await asyncio.shield(up.aclose())
+                except Exception:  # noqa: BLE001
+                    pass
+
+        try:
+            result = await asyncio.wait_for(
+                _forward_inner(path, request, on_close, ctx), timeout=timeout_secs
+            )
+        except asyncio.TimeoutError:
+            await _close_upstream()  # never leak the upstream connection on the 504 path
+            on_close(ok=False)
+            return Response(
+                content=json.dumps({"error": "per-request deadline exceeded", "code": "timeout"}),
+                status_code=504,
+                media_type="application/json",
+            )
+        except BaseException:
+            await _close_upstream()
+            on_close(ok=False)
+            raise
+        if not isinstance(result, StreamingResponse):
+            on_close(ok=result.status_code < 500, tokens=int(ctx.get("tokens", 0) or 0))
+        return result
+
+    proxy.add_api_route(
         "/{path:path}",
+        forward,
         methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "HEAD"],
     )
-    async def forward(path: str, request: Request):
+
+    async def _forward_inner(path: str, request: Request, on_close, ctx: Optional[dict] = None):
         clean_path = f"/{path.lstrip('/')}"
         method = request.method
         t0 = time.time()
@@ -439,6 +579,8 @@ def create_asgi_proxy_app(upstream_url: str, timeout_secs: float = REQUEST_TIMEO
                 params=dict(request.query_params),
             )
             resp = await client.send(upstream_req, stream=True)
+            if ctx is not None:
+                ctx["resp"] = resp
         except Exception as exc:
             elapsed_ms = (time.time() - t0) * 1000.0
             print(
@@ -459,29 +601,118 @@ def create_asgi_proxy_app(upstream_url: str, timeout_secs: float = REQUEST_TIMEO
         }
         content_type = resp.headers.get("content-type", "")
         if "text/event-stream" in content_type.lower():
+            stream_state: Dict[str, object] = {
+                "finished": False,
+                "started": False,
+                "saw_done": False,
+                "ok": False,
+                "tokens": 0,
+                "tail": b"",
+            }
+
+            def _scan_sse_bytes(raw: bytes, *, final: bool = False) -> None:
+                buf = bytes(stream_state["tail"]) + raw
+                lines = buf.split(b"\n")
+                stream_state["tail"] = b"" if final else lines.pop()
+                for raw_line in lines:
+                    line = raw_line.strip()
+                    if not line.startswith(b"data:"):
+                        continue
+                    data = line[5:].strip()
+                    if data == b"[DONE]":
+                        stream_state["saw_done"] = True
+                        continue
+                    try:
+                        parsed = json.loads(data.decode("utf-8", errors="replace"))
+                    except Exception:  # noqa: BLE001
+                        continue
+                    if not isinstance(parsed, dict):
+                        continue
+                    choices = parsed.get("choices")
+                    if isinstance(choices, list) and choices:
+                        first = choices[0] if isinstance(choices[0], dict) else {}
+                        delta = first.get("delta") if isinstance(first, dict) else None
+                        if isinstance(delta, dict):
+                            if (
+                                delta.get("content")
+                                or delta.get("reasoning_content")
+                                or delta.get("tool_calls")
+                            ):
+                                stream_state["tokens"] = int(stream_state["tokens"]) + 1
+                        elif first.get("text"):
+                            stream_state["tokens"] = int(stream_state["tokens"]) + 1
+
             async def stream_chunks():
+                stream_state["started"] = True
                 try:
-                    async for chunk in resp.aiter_raw():
+                    chunks = resp.aiter_raw().__aiter__()
+                    while True:
+                        remaining = (t0 + timeout_secs) - time.time()
+                        if remaining <= 0:
+                            raise asyncio.TimeoutError("per-request deadline exceeded")
+                        try:
+                            chunk = await asyncio.wait_for(chunks.__anext__(), timeout=remaining)
+                        except StopAsyncIteration:
+                            _scan_sse_bytes(b"", final=True)
+                            stream_state["ok"] = resp.status_code < 500
+                            break
                         if chunk:
+                            _scan_sse_bytes(chunk)
                             yield chunk
-                except Exception as exc:
+                except (GeneratorExit, asyncio.CancelledError) as exc:
+                    _scan_sse_bytes(b"", final=True)
+                    if stream_state["saw_done"]:
+                        # Standard OpenAI SSE clients close the socket as soon as they read
+                        # `data: [DONE]`; treat post-[DONE] disconnect as a clean completion.
+                        stream_state["ok"] = resp.status_code < 500
+                    else:
+                        stream_state["ok"] = False
+                        elapsed_ms = (time.time() - t0) * 1000.0
+                        print(
+                            f"[SINGULARITY proxy] Stream interrupted on {method} {clean_path} "
+                            f"after {elapsed_ms:.1f}ms: {type(exc).__name__}: {exc}",
+                            flush=True,
+                        )
+                    raise
+                except BaseException as exc:
+                    stream_state["ok"] = False
                     elapsed_ms = (time.time() - t0) * 1000.0
                     print(
                         f"[SINGULARITY proxy] Stream interrupted on {method} {clean_path} "
                         f"after {elapsed_ms:.1f}ms: {type(exc).__name__}: {exc}",
                         flush=True,
                     )
-                finally:
-                    await resp.aclose()
-                    elapsed_ms = (time.time() - t0) * 1000.0
+                    if not isinstance(exc, Exception):
+                        raise
+
+            async def _finalize_stream() -> None:
+                if stream_state["finished"]:
+                    return
+                stream_state["finished"] = True
+                try:
+                    await asyncio.shield(resp.aclose())
+                except Exception:  # noqa: BLE001
+                    pass
+                ok = bool(stream_state["ok"])
+                tokens = int(stream_state["tokens"])
+                on_close(ok=ok, tokens=tokens)
+                elapsed_ms = (time.time() - t0) * 1000.0
+                if not stream_state["started"] or (not ok and not stream_state["saw_done"]):
+                    print(
+                        f"[SINGULARITY proxy] <-- {method} {clean_path} stream abandoned before "
+                        f"completion ({elapsed_ms:.1f}ms); slot released",
+                        flush=True,
+                    )
+                else:
                     print(
                         f"[SINGULARITY proxy] <-- {method} {clean_path} {resp.status_code} "
-                        f"(SSE stream closed in {elapsed_ms:.1f}ms)",
+                        f"(SSE stream closed in {elapsed_ms:.1f}ms, tokens={tokens})",
                         flush=True,
                     )
 
-            return StreamingResponse(
+            return _ReleasingStreamingResponse(
                 stream_chunks(),
+                on_finish=_finalize_stream,
                 status_code=resp.status_code,
                 headers=resp_headers,
                 media_type="text/event-stream",
@@ -503,6 +734,16 @@ def create_asgi_proxy_app(upstream_url: str, timeout_secs: float = REQUEST_TIMEO
             )
         finally:
             await resp.aclose()
+
+        if ctx is not None and resp.status_code < 400 and "application/json" in content_type.lower():
+            try:
+                parsed_json = json.loads(payload.decode("utf-8", errors="replace"))
+                if isinstance(parsed_json, dict):
+                    usage = parsed_json.get("usage")
+                    if isinstance(usage, dict) and isinstance(usage.get("completion_tokens"), int):
+                        ctx["tokens"] = max(0, int(usage["completion_tokens"]))
+            except Exception:  # noqa: BLE001
+                pass
 
         elapsed_ms = (time.time() - t0) * 1000.0
         if method == "POST" or resp.status_code >= 400:
@@ -569,15 +810,76 @@ def ensure_checkpoint_ready(
     return precheck
 
 
+HARD_EXIT_CODE = 70  # EX_SOFTWARE: the graceful path failed; never report this as success
+HARD_EXIT_CLEANUP_SECS = 10.0
+
+
+def _hard_exit(cleanup: Optional[Callable[[], None]] = None) -> None:
+    """Last-resort exit: bounded best-effort cleanup, flush logs, then exit non-zero.
+
+    The cleanup (e.g. kill the 8-GPU child) runs in a helper thread and is abandoned after
+    `HARD_EXIT_CLEANUP_SECS`, so a hung cleanup can never prevent the exit itself.
+    """
+    import threading
+
+    print(f"[SINGULARITY container] graceful exit did not complete; hard-exit {HARD_EXIT_CODE}", flush=True)
+    if cleanup is not None:
+        def _run() -> None:
+            try:
+                cleanup()
+            except BaseException as exc:  # noqa: BLE001 - best effort, must not block exit
+                print(f"[SINGULARITY container] hard-exit cleanup failed: {type(exc).__name__}: {exc}", flush=True)
+
+        worker = threading.Thread(target=_run, name="hard-exit-cleanup", daemon=True)
+        worker.start()
+        worker.join(HARD_EXIT_CLEANUP_SECS)
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except Exception:  # noqa: BLE001
+            pass
+    os._exit(HARD_EXIT_CODE)
+
+
+def _exit_container(grace_secs: float = 60.0, cleanup: Optional[Callable[[], None]] = None) -> None:
+    """Ask the Modal runtime to shut this container down (graceful SIGINT -> `@modal.exit`).
+
+    If the runtime has not killed us after `grace_secs`, run best-effort `cleanup` and
+    hard-exit with a NON-ZERO code so a tripped guard can never leave the GPUs billing
+    (and the failure is visible rather than looking like a clean exit).
+    """
+    import signal
+    import threading
+
+    print("[SINGULARITY container] guard tripped; exiting container", flush=True)
+    timer = threading.Timer(grace_secs, lambda: _hard_exit(cleanup))
+    timer.daemon = True
+    timer.start()
+    os.kill(os.getpid(), signal.SIGINT)
+
+
 try:
     import modal
 
+    if os.environ.get("SINGULARITY_SKIP_MODAL_APP") == "1":
+        # Lets smoke_app.py reuse this module's gateway code without defining the 8x B200 app.
+        raise ImportError("SINGULARITY_SKIP_MODAL_APP=1")
+
     app = modal.App(APP_NAME)
     singularity_image = build_singularity_image()
+    _policy_env = policy_env_snapshot()
+    if _policy_env:
+        singularity_image = singularity_image.env(_policy_env)
     weights_volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
     benchmark_volume = modal.Volume.from_name(BENCHMARK_VOLUME_NAME, create_if_missing=True)
     hf_secret = modal.Secret.from_name(HF_SECRET_NAME)
-    _effective_min_containers = int(os.environ.get("SINGULARITY_MIN_CONTAINERS", "0"))
+    _policy = resolve_scaling_policy()
+    if _policy.pinned_warm:
+        print(
+            "[SINGULARITY WARNING] pinned warm capacity enabled: 8x B200 bill continuously "
+            "until redeployed with SINGULARITY_MIN_CONTAINERS=0 or torn down.",
+            flush=True,
+        )
 
     @app.function(
         image=singularity_image,
@@ -630,38 +932,85 @@ try:
             BENCHMARK_MOUNT_PATH: benchmark_volume,
         },
         secrets=[hf_secret],
-        min_containers=_effective_min_containers,
-        max_containers=MAX_CONTAINERS,
-        scaledown_window=SCALEDOWN_WINDOW_SECS,
-        startup_timeout=STARTUP_TIMEOUT_SECS,
-        timeout=REQUEST_TIMEOUT_SECS,
+        min_containers=_policy.min_containers,
+        max_containers=_policy.max_containers,
+        scaledown_window=_policy.scaledown_window_secs,
+        startup_timeout=_policy.startup_timeout_secs,
+        timeout=_policy.request_timeout_secs,
     )
     class SingularityV41Service:
         @modal.enter()
         def startup(self) -> None:
             print("[SINGULARITY container] Entering SingularityV41Service.startup()...", flush=True)
-            ensure_checkpoint_ready(
-                CHECKPOINT_DIR,
-                reload_callback=weights_volume.reload,
-                commit_callback=weights_volume.commit,
-                strict_pinned=True,
+            self.tracker = LifecycleTracker(
+                max_concurrent=_policy.max_concurrent_requests,
+                request_timeout_secs=_policy.request_timeout_secs,
+                max_lifetime_secs=_policy.max_worker_lifetime_secs,
+                gpu_count=GPU_COUNT,
+                gpu_usd_per_gpu_hour=_policy.gpu_usd_per_gpu_hour,
+                max_spend_usd=_policy.max_spend_usd,
             )
             self.supervisor = SingularityRuntimeSupervisor(
                 checkpoint_dir=CHECKPOINT_DIR,
                 host=INTERNAL_SERVER_HOST,
                 port=INTERNAL_SERVER_PORT,
             )
-            self.supervisor.start(
-                require_gpus=True,
-                ready_timeout_secs=STARTUP_TIMEOUT_SECS,
-                skip_checkpoint_revalidation=True,
+
+            def _boot() -> None:
+                # Bounded retry (network/volume flakiness only); GPU init is NOT retried
+                # in-process because a failed 8xB200 start is expensive and usually deterministic.
+                retry_bounded(
+                    lambda: ensure_checkpoint_ready(
+                        CHECKPOINT_DIR,
+                        reload_callback=weights_volume.reload,
+                        commit_callback=weights_volume.commit,
+                        strict_pinned=True,
+                    ),
+                    attempts=STARTUP_RETRY_MAX_ATTEMPTS,
+                )
+                self.supervisor.start(
+                    require_gpus=True,
+                    ready_timeout_secs=STARTUP_TIMEOUT_SECS,
+                    skip_checkpoint_revalidation=True,
+                )
+
+            result = start_with_cleanup(self.tracker, _boot, self.supervisor.stop, attempts=1)
+            if not result.ok:
+                # Re-raise so Modal fails the container instead of serving a half-initialised cluster.
+                self.tracker.transition(LifecycleState.STOPPED)
+                raise RuntimeError(f"startup failed and was cleaned up: {result.error}")
+            # Enforce lifetime/spend guards by actually exiting (admission control alone
+            # would leave the container billing). Polls local state only.
+            self.watchdog = LifecycleWatchdog(
+                self.tracker,
+                drain_timeout_secs=_policy.drain_timeout_secs,
+                stop_child=self.supervisor.stop,
+                exit_fn=lambda: _exit_container(cleanup=self.supervisor.stop),
+                liveness=self.supervisor.alive,
             )
+            self.watchdog.start()
             print("[SINGULARITY container] SingularityV41Service.startup() complete and READY.", flush=True)
 
         @modal.exit()
         def shutdown(self) -> None:
+            watchdog = getattr(self, "watchdog", None)
+            if watchdog is not None:
+                watchdog.halt()
+            tracker = getattr(self, "tracker", None)
+            if tracker is not None:
+                # Stop admitting, wait (bounded) for in-flight generations, then kill the child.
+                drained = tracker.drain(_policy.drain_timeout_secs)
+                print(
+                    f"[SINGULARITY container] drain complete={drained} snapshot={tracker.snapshot()}",
+                    flush=True,
+                )
             if hasattr(self, "supervisor"):
                 self.supervisor.stop()
+            if tracker is not None:
+                try:
+                    tracker.transition(LifecycleState.STOPPED)
+                except Exception:  # noqa: BLE001
+                    pass
 
         @modal.method()
         def inspect_status(self) -> Dict[str, object]:
@@ -674,7 +1023,10 @@ try:
         def serve(self):
             return create_asgi_proxy_app(
                 self.supervisor.base_url,
-                timeout_secs=REQUEST_TIMEOUT_SECS,
+                timeout_secs=_policy.request_timeout_secs,
+                tracker=self.tracker,
+                gpu_sampler=gpu_snapshot,
+                liveness=self.supervisor.alive,
             )
 
 except ImportError:

@@ -1,5 +1,6 @@
 //! OpenAI-shaped text/tool request adaptation for the V4.1 protocol.
 //! This module formats data only; it does not execute tools or serve requests.
+use crate::model_error as error;
 use crate::{
     v41_conversation::{self, Invocation, Message},
     v41_prompt::ThinkingMode,
@@ -8,11 +9,6 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use singularity_core::SingularityError;
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

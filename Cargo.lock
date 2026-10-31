@@ -1916,13 +1916,10 @@ name = "singularity-cache"
 version = "0.1.0"
 dependencies = [
  "parking_lot",
- "serde",
  "sha2",
  "singularity-core",
  "singularity-cuda",
  "tempfile",
- "thiserror 1.0.69",
- "tracing",
 ]
 
 [[package]]
@@ -1936,7 +1933,6 @@ dependencies = [
  "singularity-cache",
  "singularity-core",
  "singularity-cuda",
- "singularity-grammar",
  "singularity-model",
  "singularity-scheduler",
  "singularity-server",
@@ -1954,8 +1950,6 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
- "tracing",
- "uuid",
 ]
 
 [[package]]
@@ -1965,9 +1959,7 @@ dependencies = [
  "cudarc",
  "parking_lot",
  "serde",
- "serde_json",
  "singularity-core",
- "thiserror 1.0.69",
  "tokio",
  "tracing",
 ]
@@ -1976,12 +1968,8 @@ dependencies = [
 name = "singularity-grammar"
 version = "0.1.0"
 dependencies = [
- "serde",
- "serde_json",
  "singularity-core",
  "tempfile",
- "thiserror 1.0.69",
- "tracing",
 ]
 
 [[package]]
@@ -1990,18 +1978,14 @@ version = "0.1.0"
 dependencies = [
  "half",
  "memmap2",
- "parking_lot",
  "rayon",
  "serde",
  "serde_json",
  "sha2",
- "singularity-cache",
  "singularity-core",
  "singularity-cuda",
  "tempfile",
- "thiserror 1.0.69",
  "tokenizers",
- "tracing",
 ]
 
 [[package]]
@@ -2030,7 +2014,6 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "singularity-cache",
  "singularity-core",
  "singularity-cuda",
@@ -2038,12 +2021,9 @@ dependencies = [
  "singularity-model",
  "singularity-scheduler",
  "tempfile",
- "thiserror 1.0.69",
  "tokio",
- "tower",
  "tower-http",
  "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
@@ -2066,8 +2046,6 @@ dependencies = [
  "singularity-server",
  "tempfile",
  "tokio",
- "tracing",
- "uuid",
 ]
 
 [[package]]

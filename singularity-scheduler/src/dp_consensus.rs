@@ -1,3 +1,4 @@
+use crate::rank_health::CollectiveError;
 use singularity_core::{EngineType, SchedulerConfig};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,40 @@ impl DpConsensusEngine {
         }
     }
 
+    /// Like [`Self::decide_step_type`] but the reduce can fail (timeout / dead rank).
+    /// On error the engine state is left untouched and the error is returned, so the
+    /// caller fails fast instead of acting on a fabricated vote.
+    pub fn decide_step_type_checked<F>(
+        &mut self,
+        local_has_prompts: bool,
+        mut dp_all_reduce_fn: F,
+    ) -> Result<StepType, CollectiveError>
+    where
+        F: FnMut(i32, &str) -> Result<i32, CollectiveError>,
+    {
+        let saved = self.decode_step;
+        let mut failure: Option<CollectiveError> = None;
+        let step = self.decide_step_type(local_has_prompts, |v, op| {
+            if failure.is_some() {
+                return v;
+            }
+            match dp_all_reduce_fn(v, op) {
+                Ok(x) => x,
+                Err(e) => {
+                    failure = Some(e);
+                    v
+                }
+            }
+        });
+        match failure {
+            Some(e) => {
+                self.decode_step = saved;
+                Err(e)
+            }
+            None => Ok(step),
+        }
+    }
+
     /// Two-phase validation: if all ranks scheduled 0 tokens during prefill,
     /// switch step type immediately to Decode to avoid infinite zero-work loops.
     pub fn validate_two_phase<F>(
@@ -94,6 +129,25 @@ impl DpConsensusEngine {
             StepType::Decode
         } else {
             StepType::Prefill
+        }
+    }
+
+    /// Like [`Self::validate_two_phase`] but the reduce can fail; state untouched on error.
+    pub fn validate_two_phase_checked<F>(
+        &mut self,
+        scheduled_tokens: usize,
+        mut dp_all_reduce_fn: F,
+    ) -> Result<StepType, CollectiveError>
+    where
+        F: FnMut(i32, &str) -> Result<i32, CollectiveError>,
+    {
+        let vote = if scheduled_tokens > 0 { 1 } else { 0 };
+        let max_scheduled = dp_all_reduce_fn(vote, "MAX")?;
+        if max_scheduled == 0 {
+            self.decode_step = self.decode_step.wrapping_add(1);
+            Ok(StepType::Decode)
+        } else {
+            Ok(StepType::Prefill)
         }
     }
 
@@ -117,5 +171,24 @@ mod tests {
         // Should not panic with divide by zero!
         let step = consensus.decide_step_type(false, |_vote, _op| 0);
         assert_eq!(step, StepType::Decode);
+    }
+
+    #[test]
+    fn checked_decide_propagates_collective_failure_and_keeps_state() {
+        let config = SchedulerConfig {
+            prefill_attempt_interval: 1,
+            prefill_any_attempt_interval: 1,
+            ..Default::default()
+        };
+        let mut consensus = DpConsensusEngine::new(config);
+        let err = consensus
+            .decide_step_type_checked(true, |_v, _op| {
+                Err(CollectiveError::Timeout(std::time::Duration::from_secs(1)))
+            })
+            .unwrap_err();
+        assert!(matches!(err, CollectiveError::Timeout(_)));
+        assert_eq!(consensus.current_decode_step(), 0);
+        let ok = consensus.decide_step_type_checked(true, |v, _op| Ok(v));
+        assert!(ok.is_ok());
     }
 }

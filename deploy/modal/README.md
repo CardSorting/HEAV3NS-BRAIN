@@ -37,7 +37,11 @@ This directory implements the production deployment, Lossless CSF checkpoint hyd
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `SINGULARITY_MIN_CONTAINERS` | `0` | Number of warm 8× B200 containers (`0` = scale-to-zero after 300s idle; `1` = pinned warm) |
+| `SINGULARITY_MIN_CONTAINERS` | `0` | Warm 8× B200 containers. `>0` is **refused** unless `SINGULARITY_ALLOW_PINNED_WARM=1` (pinned warm bills continuously, no finite bound) |
+| `SINGULARITY_ALLOW_PINNED_WARM` | `0` | Explicit opt-in for `SINGULARITY_MIN_CONTAINERS>0`; revert or `teardown` afterwards |
+| `SINGULARITY_SCALEDOWN_WINDOW_SECS` | `300` | Idle seconds before the container is released; hard max 900 |
+| `SINGULARITY_REQUEST_TIMEOUT_SECS` | `1800` | Per-request execution bound; hard max 3600 |
+| `SINGULARITY_MAX_CONTAINERS` | `1` | Provisioned-node cap; can be lowered, never raised above 1 |
 | `SINGULARITY_FULL_CPU_REFERENCE` | `0` | Set to `1` only for offline 40-layer CPU reference parity runs |
 | `SINGULARITY_API_KEY` | unset | Optional Bearer token enforced on `/v1/models`, `/v1/chat/completions`, and `/v1/completions` |
 | `SINGULARITY_MODAL_URL` | live URL | Default target endpoint for `health`, `test-inference`, `test-stream`, and `benchmark` |
@@ -77,3 +81,13 @@ python3 deploy/modal/deploy.py teardown
 - [PLAYBOOK-002: Startup Hang & Latency Triage](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/playbooks/PLAYBOOK-002-startup-hang-and-latency-triage.md)
 - [PLAYBOOK-003: Controlled Benchmarking & ORE Calibration](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/playbooks/PLAYBOOK-003-benchmarking-and-ore-calibration.md)
 - [PLAYBOOK-004: Cost Governance & Container Lifecycle](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/knowledge-base/playbooks/PLAYBOOK-004-cost-governance-and-container-lifecycle.md)
+
+## Scale-to-zero operations (singularity3.md)
+
+- `python3 -m deploy.modal.deploy status [--url URL]` — policy + provider-side zero-compute check (a live URL query resets the idle window).
+- `python3 -m deploy.modal.deploy audit [--terminate-orphans]` — list provider containers, flag orphans; report-only unless the flag is given. Without Modal credentials it reports `unverifiable`, never `zero`.
+- `python3 -m deploy.modal.deploy measure-cold-start --url URL` — first-request vs warm TTFT (measured; cold only if `audit` showed zero first).
+- Limits (env): SINGULARITY_MAX_CONCURRENT_REQUESTS, _DRAIN_TIMEOUT_SECS, _MAX_WORKER_LIFETIME_SECS (serving time: clock starts when the worker is READY, not at container start), _GPU_USD_PER_GPU_HOUR, _MAX_SPEND_USD (needs price; counted from container start), plus the existing MIN/MAX_CONTAINERS, SCALEDOWN_WINDOW_SECS, REQUEST_TIMEOUT_SECS.
+- In-container (Rust server) hang guard: `SINGULARITY_STEP_STALL_TIMEOUT_SECS` (default 600, `0` disables) — a scheduler step stuck longer than this poisons the scheduler, cancels clients and exits the server with code 70, which the gateway reports as `worker_dead`.
+- Do not point uptime monitors at the endpoint: any request resets the idle window. Full details: docs/SCALE_TO_ZERO_REPORT.md.
+- Tests: `python3 -m unittest discover -s deploy/modal -p "test_*.py"`.

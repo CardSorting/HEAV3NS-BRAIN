@@ -1,16 +1,12 @@
 //! CPU reference coordination for compressed attention across backbone layers.
 //! One SharedAttention belongs to one sequence; layers must run in order per token.
+use crate::model_error as error;
 use crate::{
     v41_attention::LoadedWindowAttention, v41_compressor::Compressor, v41_config::TextConfig,
     v41_indexer::Indexer, v41_quant::fp4_activation_dequant, v41_rope, SafetensorsMmapLoader,
 };
 use singularity_core::SingularityError;
 use std::collections::HashMap;
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
 
 #[derive(Clone, Default)]
 pub struct SharedAttention {

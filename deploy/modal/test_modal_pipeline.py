@@ -1,4 +1,5 @@
 """Unit tests for the SINGULARITY Modal deployment, storage, health, and benchmark pipeline."""
+# ruff: noqa: E402  (imports follow the intentional sys.path bootstrap below)
 
 from __future__ import annotations
 
@@ -30,10 +31,18 @@ def _resolve_repo_root(file_path: Path) -> Path:
 
 _MODAL_DIR = str(Path(__file__).resolve().parent)
 _REPO_ROOT = str(_resolve_repo_root(Path(__file__)))
-if _MODAL_DIR in sys.path and (Path(_MODAL_DIR) / "deploy.py").is_file():
-    sys.path.remove(_MODAL_DIR)
-if _REPO_ROOT not in sys.path:
+# Non-destructive: never remove entries (unittest discovery may add _MODAL_DIR at
+# sys.path[0]). Instead ensure the repo root precedes it so the `deploy` *package*
+# wins over deploy/modal/deploy.py, and evict a mis-resolved `deploy` module.
+if _REPO_ROOT in sys.path:
+    if sys.path.index(_REPO_ROOT) > 0 and _MODAL_DIR in sys.path[: sys.path.index(_REPO_ROOT)]:
+        sys.path.remove(_REPO_ROOT)
+        sys.path.insert(0, _REPO_ROOT)
+else:
     sys.path.insert(0, _REPO_ROOT)
+_loaded_deploy = sys.modules.get("deploy")
+if _loaded_deploy is not None and not hasattr(_loaded_deploy, "__path__"):
+    del sys.modules["deploy"]
 
 from deploy.modal.app import (
     STARTUP_SEQUENCE_STEPS,
@@ -498,6 +507,7 @@ class ModalPipelineTests(unittest.TestCase):
             ("deploy/modal/health.py", "/root/health.py"),
             ("deploy/modal/benchmark.py", "/root/benchmark.py"),
             ("deploy/modal/model_storage.py", "/root/model_storage.py"),
+            ("deploy/modal/smoke_app.py", "/root/smoke_app.py"),
             ("deploy/modal/app.py", "/app.py"),
         ):
             import types

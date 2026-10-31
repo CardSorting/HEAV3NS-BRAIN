@@ -3,6 +3,13 @@
     allow(clippy::useless_vec, clippy::unnecessary_cast, clippy::manual_div_ceil)
 )]
 
+/// Shared constructor for model-layer errors (replaces 21 byte-identical per-module copies).
+pub(crate) fn model_error(reason: &str) -> singularity_core::SingularityError {
+    singularity_core::SingularityError::ModelError {
+        reason: reason.into(),
+    }
+}
+
 pub mod attention;
 pub mod engram;
 pub mod moe;

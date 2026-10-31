@@ -5,11 +5,7 @@
 use half::bf16;
 use singularity_core::SingularityError;
 
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
+use crate::model_error as error;
 
 const fn compute_e4m3fn(byte: u8) -> f32 {
     let sign = if byte & 0x80 == 0 { 1.0 } else { -1.0 };

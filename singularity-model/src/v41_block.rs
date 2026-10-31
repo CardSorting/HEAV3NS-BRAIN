@@ -9,11 +9,7 @@ use crate::{
 use half::bf16;
 use singularity_core::SingularityError;
 
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
+use crate::model_error as error;
 
 #[derive(Clone)]
 pub struct RmsNorm {

@@ -37,11 +37,9 @@ if __package__ in (None, ""):
         sys.path.insert(0, _repo_root)
     from deploy.modal.config import (
         CHECKPOINT_DIR,
-        CSF_CODEC,
         CSF_COMPRESSED_SCALE_COUNT,
         CSF_MODEL_ID,
         CSF_PINNED_REVISION,
-        CSF_SCHEMA,
         CSF_TOTAL_BYTES,
         MODEL_ID,
         PINNED_INDEX_SHA256,
@@ -54,11 +52,9 @@ if __package__ in (None, ""):
 else:
     from .config import (
         CHECKPOINT_DIR,
-        CSF_CODEC,
         CSF_COMPRESSED_SCALE_COUNT,
         CSF_MODEL_ID,
         CSF_PINNED_REVISION,
-        CSF_SCHEMA,
         CSF_TOTAL_BYTES,
         MODEL_ID,
         PINNED_INDEX_SHA256,

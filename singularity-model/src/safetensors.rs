@@ -484,14 +484,15 @@ impl SafetensorsMmapLoader {
                 .to_string();
             let exc_key = format!("{logical_name}{CSF_EXCEPTIONS_SUFFIX}");
             let fixed_info = tensors.remove(&fixed_key).unwrap();
-            let exc_info = tensors
-                .remove(&exc_key)
-                .ok_or_else(|| SingularityError::ModelError {
-                    reason: format!(
-                        "Missing companion CSF exceptions tensor '{exc_key}' in '{}'",
-                        path.display()
-                    ),
-                })?;
+            let exc_info =
+                tensors
+                    .remove(&exc_key)
+                    .ok_or_else(|| SingularityError::ModelError {
+                        reason: format!(
+                            "Missing companion CSF exceptions tensor '{exc_key}' in '{}'",
+                            path.display()
+                        ),
+                    })?;
             if fixed_info.dtype != "U8"
                 || fixed_info.shape.len() != 1
                 || exc_info.dtype != "U32"
@@ -504,13 +505,13 @@ impl SafetensorsMmapLoader {
                     ),
                 });
             }
-            let prefix = logical_name
-                .strip_suffix(".scale")
-                .ok_or_else(|| SingularityError::ModelError {
+            let prefix = logical_name.strip_suffix(".scale").ok_or_else(|| {
+                SingularityError::ModelError {
                     reason: format!(
                         "CSF compressed tensor '{logical_name}' does not end with '.scale'"
                     ),
-                })?;
+                }
+            })?;
             let weight_name = format!("{prefix}.weight");
             let weight_info = tensors.get(&weight_name).ok_or_else(|| {
                 SingularityError::ModelError {

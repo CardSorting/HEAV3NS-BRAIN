@@ -1,5 +1,6 @@
 //! CPU reference for V4.1 image grid planning, token layout and RGB patch order.
 //! The caller must decode and resize/pad the image before `patchify_rgb`.
+use crate::model_error as error;
 use crate::{
     v41_compressor::Bf16Matrix,
     v41_config::{TextConfig, VisionConfig},
@@ -7,11 +8,6 @@ use crate::{
 };
 use half::bf16;
 use singularity_core::SingularityError;
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImageGrid {

@@ -99,7 +99,10 @@ def validate(real_weights: bool = False) -> dict:
         raise RuntimeError(f"Expected eight visible GPUs; got {count.value}")
     devices = []
     for ordinal in range(count.value):
-        device=ctypes.c_int(); name=ctypes.create_string_buffer(256); major=ctypes.c_int(); minor=ctypes.c_int()
+        device = ctypes.c_int()
+        name = ctypes.create_string_buffer(256)
+        major = ctypes.c_int()
+        minor = ctypes.c_int()
         check(driver.cuDeviceGet(ctypes.byref(device), ordinal), "cuDeviceGet")
         check(driver.cuDeviceGetName(name, len(name), device), "cuDeviceGetName")
         check(driver.cuDeviceComputeCapability(ctypes.byref(major), ctypes.byref(minor), device), "cuDeviceComputeCapability")

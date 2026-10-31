@@ -119,3 +119,24 @@ During our deep audit of the SINGULARITY workspace, we identified and eliminated
 - **Audit Finding**: `create_asgi_proxy_app` instantiated and closed a brand-new `httpx.AsyncClient` on every incoming HTTP request, creating connection pool and TCP socket churn on loopback (`127.0.0.1:8080`) during concurrent benchmark sweeps (`concurrency=64`).
 - **ORE Fix**: Replaced per-request client creation with a loop-scoped, connection-pooled `httpx.AsyncClient` (`max_connections=256`, `max_keepalive_connections=64`) managed by the FastAPI lifespan context and exposed via `proxy.state.get_upstream_client` / `proxy.state.close_upstream_client`.
 
+### 3.7 True Scale-to-Zero Lifecycle, Deploy-Time Policy Snapshot & SSE `[DONE]` Accounting
+- **Files**: [`deploy/modal/config.py`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/deploy/modal/config.py), [`deploy/modal/lifecycle.py`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/deploy/modal/lifecycle.py), [`deploy/modal/ops.py`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/deploy/modal/ops.py), [`deploy/modal/app.py`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/deploy/modal/app.py), [`deploy/modal/deepinfer_app.py`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/deploy/modal/deepinfer_app.py)
+- **Audit Findings**:
+  1. Deploy-time `SINGULARITY_*` policy variables were not propagated into the container image environment (`PM-004`), causing in-container `LifecycleTracker` and `LifecycleWatchdog` to silently fall back to defaults.
+  2. Standard OpenAI/`urllib` SSE clients close the TCP socket immediately after reading `data: [DONE]` (`PM-005`), exiting Starlette's `StreamingResponse` before `stream_chunks()` resumed after its final `yield` and causing completed SSE streams to be misclassified as `"stream abandoned"` (`failed += 1`, `tokens_out = 0`).
+  3. `DeepInferReferenceService.startup()` caught `Exception` without re-raising, risking an unready 8×B200 container staying alive and billing.
+- **ORE Fixes**:
+  1. Added `config.policy_env_snapshot()` to bake whitelisted `SINGULARITY_*` policy variables into all Modal images (`app.py`, `deepinfer_app.py`, `smoke_app.py`) and exposed enforced `limits` in `/__lifecycle/status`.
+  2. Updated `_ReleasingStreamingResponse.__call__` to explicitly `await self.body_iterator.aclose()` before `await self._on_finish()`, tracked `saw_done` and SSE token delta events in `stream_chunks()`, and parsed `usage.completion_tokens` on JSON responses.
+  3. Wired `LifecycleTracker`, `LifecycleWatchdog`, `@modal.exit()`, and startup exception propagation into `deepinfer_app.py`, and added `SMOKE_APP_NAME` to `KNOWN_APP_NAMES` for provider-side orphan auditing and `deploy.py teardown`.
+
+### 3.8 Distributed Rank-Health Isolation, `ExternalStepGuard` & KV Block Pin Safety
+- **Files**: [`singularity-scheduler/src/rank_health.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-scheduler/src/rank_health.rs), [`singularity-scheduler/src/zos_pipeline.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-scheduler/src/zos_pipeline.rs), [`singularity-cache/src/block_manager.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-cache/src/block_manager.rs), [`singularity-server/src/handlers.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-server/src/handlers.rs), [`singularity-cli/src/main.rs`](file:///Users/bozoegg/Desktop/HEAV3NS-BRAIN/singularity-cli/src/main.rs)
+- **Audit Findings**:
+  1. Synchronous V4.1 forward passes (`spawn_blocking`) were not tracked as active steps on `ZosScheduler`, and `/ready` / `/health` did not inspect `state.scheduler.is_poisoned()`.
+  2. `ZosScheduler::submit_sequence` had a TOCTOU window with `poison()` and did not roll back partial `pin_block` calls on mid-loop failure; `PagedBlockManager::pin_block` did not reject unallocated blocks; `execute_host_development_chat` leaked a subscriber channel in `scheduler.listeners` if `submit_sequence` failed.
+- **ORE Fixes**:
+  1. Added `ExternalStepGuard` (`enter_external_step` with `AtomicUsize` active-step tracking) around V4.1 generation, wired `/ready` and `/v1/chat/completions` to fail fast with `HTTP 503` when poisoned, and cleaned up subscriber listeners via `cancel_sequence` on submit error.
+  2. Enforced `is_block_allocated` in `PagedBlockManager::pin_block`, added partial-pin rollback (`unpin_block`) and under-lock `fatal` verification in `submit_sequence`, and wired `SIGINT`/`SIGTERM` graceful shutdown into `singularity-cli serve`.
+
+

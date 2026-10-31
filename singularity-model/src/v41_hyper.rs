@@ -6,11 +6,7 @@
 use half::bf16;
 use singularity_core::SingularityError;
 
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
+use crate::model_error as error;
 
 #[derive(Debug)]
 pub struct HcWeights {
@@ -275,7 +271,7 @@ pub fn hc_pre(
     Ok(out)
 }
 
-/// Add sublayer output and mix residual streams. `comb` is [source,destination].
+/// Add sublayer output and mix residual streams. `comb` is indexed `[source, destination]`.
 pub fn hc_post(
     output: &[f32],
     residual: &[f32],

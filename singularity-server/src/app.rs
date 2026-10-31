@@ -16,11 +16,47 @@ use parking_lot::RwLock;
 use singularity_cache::{PagedBlockManager, RadixTree};
 use singularity_core::{MetricsCollector, SingularityError, SystemConfig};
 use singularity_cuda::{GpuBackend, MockGpuBackend};
-use singularity_scheduler::ZosScheduler;
+use singularity_scheduler::{RankHealthMonitor, ZosScheduler};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tower_http::cors::CorsLayer;
 use tower_http::trace::TraceLayer;
+
+/// Exit code used when the serving group is declared dead (EX_SOFTWARE).
+pub const EXIT_GROUP_FAILED: i32 = 70;
+
+/// Max seconds a single scheduler step may run before it is declared hung.
+/// `SINGULARITY_STEP_STALL_TIMEOUT_SECS`; 0 disables. Default 600.
+fn step_stall_timeout_secs() -> u64 {
+    std::env::var("SINGULARITY_STEP_STALL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(600)
+}
+
+/// Independent watchdog thread: detects a dead/hung rank (the stepping thread cannot
+/// report its own hang), poisons the scheduler so every client is released, then exits
+/// the process non-zero after a short grace so the container stops billing instead of
+/// serving from a broken group. Holds only a `Weak` ref: it ends when the scheduler drops.
+fn spawn_rank_watchdog(scheduler: &Arc<ZosScheduler>) {
+    let weak = Arc::downgrade(scheduler);
+    let _ = std::thread::Builder::new()
+        .name("rank-watchdog".into())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let Some(s) = weak.upgrade() else { return };
+            if let Some(err) = s.watchdog_tick() {
+                drop(s);
+                eprintln!("FATAL: {err}; exiting with code {EXIT_GROUP_FAILED}");
+                std::thread::sleep(Duration::from_secs(2));
+                if weak.strong_count() == 0 {
+                    return;
+                }
+                std::process::exit(EXIT_GROUP_FAILED);
+            }
+        });
+}
 
 pub struct AppState {
     pub config: SystemConfig,
@@ -49,13 +85,23 @@ impl AppState {
         block_manager: Arc<PagedBlockManager>,
     ) -> Result<Arc<Self>, SingularityError> {
         let radix_tree = Arc::new(RadixTree::new(config.cache.max_prefix_cache_nodes));
-        let scheduler = Arc::new(ZosScheduler::with_model(
+        let mut scheduler = ZosScheduler::with_model(
             config.scheduler.clone(),
             block_manager.clone(),
             radix_tree.clone(),
             gpu_backend.clone(),
             model,
-        )?);
+        )?;
+        let stall_secs = step_stall_timeout_secs();
+        if stall_secs > 0 {
+            let timeout = Duration::from_secs(stall_secs);
+            let monitor = Arc::new(RankHealthMonitor::new(1, timeout, Instant::now()));
+            scheduler = scheduler.with_rank_health(monitor, 0, timeout);
+        }
+        let scheduler = Arc::new(scheduler);
+        if stall_secs > 0 {
+            spawn_rank_watchdog(&scheduler);
+        }
 
         let circuit_breaker = Arc::new(CircuitBreaker::default_breaker());
         let rate_governor = Arc::new(LeakyTokenBucket::new(

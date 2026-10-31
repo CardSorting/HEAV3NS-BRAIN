@@ -314,11 +314,7 @@ impl<'a> LoadedWindowAttention<'a> {
     }
 }
 
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
+use crate::model_error as error;
 
 /// Emulate the reference's in-place BF16 -> block FP8 -> BF16 activation quantization.
 fn quantize_dequantize(input: &[f32]) -> Result<Vec<f32>, SingularityError> {

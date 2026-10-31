@@ -6,11 +6,7 @@ use crate::v41_quant::{e4m3fn, ue8m0, CheckpointMatrix};
 use half::bf16;
 use singularity_core::SingularityError;
 
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
+use crate::model_error as error;
 
 pub struct EngramTable<'a> {
     weights: &'a [u8],

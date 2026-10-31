@@ -10,11 +10,7 @@ const INVOKE: &str = "<｜DSML｜ invoke name=\"";
 const INVOKE_END: &str = "</｜DSML｜ invoke>";
 const PARAM: &str = "<｜DSML｜ parameter name=\"";
 const PARAM_END: &str = "</｜DSML｜ parameter>";
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
+use crate::model_error as error;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {

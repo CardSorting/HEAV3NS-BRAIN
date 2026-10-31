@@ -45,14 +45,18 @@ if __package__ in (None, ""):
         HF_SECRET_NAME,
         MEMORY_MB,
         MODEL_ID,
-        REQUEST_TIMEOUT_SECS,
-        SCALEDOWN_WINDOW_SECS,
+        REQUEST_TIMEOUT_MAX_SECS,
+        SCALEDOWN_WINDOW_MAX_SECS,
         STARTUP_TIMEOUT_SECS,
         VOLUME_MOUNT_PATH,
         VOLUME_NAME,
+        policy_env_snapshot,
+        resolve_scaling_policy,
     )
+    from deploy.modal.app import _exit_container
     from deploy.modal.health import verify_gpu_topology
     from deploy.modal.image import build_deepinfer_image
+    from deploy.modal.lifecycle import LifecycleState, LifecycleTracker, LifecycleWatchdog
     from deploy.modal.model_storage import (
         download_pinned_checkpoint,
         prepare_csf_checkpoint_directory,
@@ -72,14 +76,18 @@ else:
         HF_SECRET_NAME,
         MEMORY_MB,
         MODEL_ID,
-        REQUEST_TIMEOUT_SECS,
-        SCALEDOWN_WINDOW_SECS,
+        REQUEST_TIMEOUT_MAX_SECS,
+        SCALEDOWN_WINDOW_MAX_SECS,
         STARTUP_TIMEOUT_SECS,
         VOLUME_MOUNT_PATH,
         VOLUME_NAME,
+        policy_env_snapshot,
+        resolve_scaling_policy,
     )
+    from .app import _exit_container
     from .health import verify_gpu_topology
     from .image import build_deepinfer_image
+    from .lifecycle import LifecycleState, LifecycleTracker, LifecycleWatchdog
     from .model_storage import (
         download_pinned_checkpoint,
         prepare_csf_checkpoint_directory,
@@ -251,10 +259,19 @@ def create_deepinfer_adapter_app(service: object):
 
 
 try:
+    import os
     import modal
 
+    if os.environ.get("SINGULARITY_SKIP_MODAL_APP") == "1":
+        raise ImportError("SINGULARITY_SKIP_MODAL_APP=1")
+
+    _di_policy = resolve_scaling_policy()
     deepinfer_app = modal.App(DEEPINFER_APP_NAME)
+    app = deepinfer_app
     deepinfer_image = build_deepinfer_image()
+    _di_policy_env = policy_env_snapshot()
+    if _di_policy_env:
+        deepinfer_image = deepinfer_image.env(_di_policy_env)
     weights_volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
     benchmark_volume = modal.Volume.from_name(BENCHMARK_VOLUME_NAME, create_if_missing=True)
     hf_secret = modal.Secret.from_name(HF_SECRET_NAME)
@@ -269,40 +286,50 @@ try:
             BENCHMARK_MOUNT_PATH: benchmark_volume,
         },
         secrets=[hf_secret],
-        min_containers=0,
+        min_containers=0,  # never pinned: reference service must scale to zero
         max_containers=1,
-        scaledown_window=SCALEDOWN_WINDOW_SECS,
+        scaledown_window=min(_di_policy.scaledown_window_secs, SCALEDOWN_WINDOW_MAX_SECS),
         startup_timeout=STARTUP_TIMEOUT_SECS,
-        timeout=REQUEST_TIMEOUT_SECS,
+        timeout=min(_di_policy.request_timeout_secs, REQUEST_TIMEOUT_MAX_SECS),
     )
     class DeepInferReferenceService:
         @modal.enter()
         def startup(self) -> None:
-            weights_volume.reload()
-            gpu_info = verify_gpu_topology(expected_gpus=GPU_COUNT)
-            if not gpu_info["valid"]:
-                raise RuntimeError(f"DeepInfer B200 topology check failed: {gpu_info['errors']}")
-            if Path(CHECKPOINT_DIR).is_dir():
-                prepare_csf_checkpoint_directory(CHECKPOINT_DIR)
-            ckpt_info = validate_checkpoint_directory(
-                CHECKPOINT_DIR, strict_pinned=True, verify_shard_headers=True
+            self.tracker = LifecycleTracker(
+                max_concurrent=_di_policy.max_concurrent_requests,
+                request_timeout_secs=_di_policy.request_timeout_secs,
+                max_lifetime_secs=_di_policy.max_worker_lifetime_secs,
+                gpu_count=GPU_COUNT,
+                gpu_usd_per_gpu_hour=_di_policy.gpu_usd_per_gpu_hour,
+                max_spend_usd=_di_policy.max_spend_usd,
             )
-            if not ckpt_info["valid"]:
-                download_pinned_checkpoint(
-                    CHECKPOINT_DIR,
-                    repo_id=CSF_MODEL_ID,
-                    revision=CSF_PINNED_REVISION,
-                    commit_callback=weights_volume.commit,
-                )
-                weights_volume.commit()
+            self.tracker.transition(LifecycleState.INITIALIZING)
+            self.llm = None
+            self.tokenizer = None
+            self.ready = False
+            try:
+                weights_volume.reload()
+                gpu_info = verify_gpu_topology(expected_gpus=GPU_COUNT)
+                if not gpu_info["valid"]:
+                    raise RuntimeError(f"DeepInfer B200 topology check failed: {gpu_info['errors']}")
+                if Path(CHECKPOINT_DIR).is_dir():
+                    prepare_csf_checkpoint_directory(CHECKPOINT_DIR)
                 ckpt_info = validate_checkpoint_directory(
                     CHECKPOINT_DIR, strict_pinned=True, verify_shard_headers=True
                 )
                 if not ckpt_info["valid"]:
-                    raise RuntimeError(f"DeepInfer checkpoint check failed: {ckpt_info['errors']}")
-            self.llm = None
-            self.tokenizer = None
-            try:
+                    download_pinned_checkpoint(
+                        CHECKPOINT_DIR,
+                        repo_id=CSF_MODEL_ID,
+                        revision=CSF_PINNED_REVISION,
+                        commit_callback=weights_volume.commit,
+                    )
+                    weights_volume.commit()
+                    ckpt_info = validate_checkpoint_directory(
+                        CHECKPOINT_DIR, strict_pinned=True, verify_shard_headers=True
+                    )
+                    if not ckpt_info["valid"]:
+                        raise RuntimeError(f"DeepInfer checkpoint check failed: {ckpt_info['errors']}")
                 from deepinfer.entrypoints.llm import LLM
                 from transformers import AutoTokenizer
 
@@ -310,9 +337,41 @@ try:
                     CHECKPOINT_DIR, trust_remote_code=True
                 )
                 self.llm = LLM(model=CHECKPOINT_DIR, max_model_len=131_072)
-            except Exception as exc:
-                self.startup_warning = str(exc)
-            self.ready = self.llm is not None
+                self.ready = True
+                self.tracker.transition(LifecycleState.READY)
+            except Exception:
+                self.ready = False
+                self.llm = None
+                self.tracker.transition(LifecycleState.FAILED)
+                self.tracker.transition(LifecycleState.STOPPED)
+                raise
+            self.watchdog = LifecycleWatchdog(
+                self.tracker,
+                drain_timeout_secs=_di_policy.drain_timeout_secs,
+                stop_child=self._cleanup_llm,
+                exit_fn=lambda: _exit_container(cleanup=self._cleanup_llm),
+                liveness=lambda: bool(getattr(self, "ready", False) and getattr(self, "llm", None) is not None),
+            )
+            self.watchdog.start()
+
+        def _cleanup_llm(self) -> None:
+            self.ready = False
+            self.llm = None
+
+        @modal.exit()
+        def shutdown(self) -> None:
+            watchdog = getattr(self, "watchdog", None)
+            if watchdog is not None:
+                watchdog.halt()
+            tracker = getattr(self, "tracker", None)
+            if tracker is not None:
+                tracker.drain(_di_policy.drain_timeout_secs)
+            self._cleanup_llm()
+            if tracker is not None:
+                try:
+                    tracker.transition(LifecycleState.STOPPED)
+                except Exception:  # noqa: BLE001
+                    pass
 
         @modal.method()
         def status(self) -> Dict[str, object]:
@@ -329,5 +388,6 @@ try:
 
 except ImportError:
     deepinfer_app = None
+    app = None
     DeepInferReferenceService = None
 

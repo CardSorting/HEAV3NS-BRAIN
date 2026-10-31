@@ -6,11 +6,7 @@ use crate::v41_quant::CheckpointMatrix;
 use half::bf16;
 use singularity_core::SingularityError;
 
-fn error(reason: &str) -> SingularityError {
-    SingularityError::ModelError {
-        reason: reason.into(),
-    }
-}
+use crate::model_error as error;
 
 #[derive(Debug, Clone)]
 pub struct Route {
@@ -437,7 +433,8 @@ fn forward_single_impl(
         let expert = experts[route.expert]
             .as_ref()
             .ok_or_else(|| error("Selected expert is not locally available"))?;
-        let value = expert.forward_impl(input, Some(route.weight), quantized, shared_act.as_ref())?;
+        let value =
+            expert.forward_impl(input, Some(route.weight), quantized, shared_act.as_ref())?;
         if value.len() != output.len() {
             return Err(error("Expert output shape mismatch"));
         }
